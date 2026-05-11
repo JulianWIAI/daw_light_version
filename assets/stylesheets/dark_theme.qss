@@ -1,0 +1,26 @@
+/*
+ * dark_theme.qss — Optional QSS override file for SBS-Synth Master
+ *
+ * Load this file at startup via QApplication.setStyleSheet(open(...).read())
+ * to override the inline palette defined in gui_windows.py.
+ *
+ * This file is intentionally minimal — the base stylesheet is embedded
+ * in gui_windows.py::STYLESHEET so the app works without this file.
+ */
+
+QToolTip {
+    background-color: #0F3460;
+    color: #EAEAEA;
+    border: 1px solid #533483;
+    padding: 4px 8px;
+    border-radius: 3px;
+    font-size: 12px;
+}
+
+QDialog {
+    background-color: #1A1A2E;
+}
+
+QScrollArea {
+    border: none;
+}

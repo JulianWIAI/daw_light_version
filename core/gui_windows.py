@@ -1,0 +1,5221 @@
+"""
+gui_windows.py — SBS-Synth Master  ✦  Bioluminescent Crystal UI
+================================================================
+Visual concept: "Pokémon Legends Z-A meets Futuristic Alice in Wonderland"
+    Deep space-black backgrounds with glowing crystal-cyan and hot-pink
+    neon accents.  Every panel looks like a floating holographic slab lit
+    from within.  Notes pulse like bioluminescent spores.
+
+Architecture (unchanged from previous revision):
+    Pure presentation layer — all logic lives in AudioEngine / MidiLogic /
+    ControllerManager / EffectChain.  The window only translates Qt events
+    into calls on those objects.
+
+New in this revision:
+    • Per-instrument piano roll  — active track vivid, others are ghost notes.
+    • EffectsPanel dock          — EQ, Reverb, Compressor, Chorus per track.
+    • Composition-mode toggle    — switch between focused-track and all-tracks.
+    • WAV export                 — renders via FluidSynth CLI.
+    • New Project                — clears everything and resets state.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import struct
+import tempfile
+import wave
+from typing import Dict, List, Optional, Tuple
+
+from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, Signal, Slot
+from PySide6.QtGui import (
+    QColor, QPainter, QPen, QBrush, QFont, QKeyEvent,
+    QLinearGradient, QRadialGradient, QPainterPath,
+)
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QSlider, QPushButton, QSpinBox, QDoubleSpinBox, QComboBox,
+    QScrollArea, QScrollBar, QFrame, QDockWidget, QStatusBar, QToolBar,
+    QDialog, QGridLayout, QLineEdit, QMessageBox, QFileDialog, QInputDialog,
+    QListWidget, QListWidgetItem, QSplitter, QSizePolicy, QCheckBox,
+    QGroupBox, QDial, QStackedWidget, QMenu, QRadioButton, QButtonGroup,
+    QProgressDialog, QTabWidget,
+)
+
+from .audio_engine import AudioEngine, InstrumentPlugin, GM_INSTRUMENTS
+from .midi_logic import (
+    MidiLogic, MidiNote, MidiClip, MidiTrack,
+    AudioClip, AudioTrack,
+)
+from .controller import ControllerManager, SCALES
+from .effects import EffectChain
+from .vst_engine import VstManager, VstTrack, scan_vst_paths
+
+logger = logging.getLogger(__name__)
+
+
+def _generate_waveform_peaks(path: str, n_peaks: int = 200) -> Optional[List[float]]:
+    """Read a WAV file and return normalised peak values (0.0–1.0) for display."""
+    try:
+        with wave.open(path, "rb") as wf:
+            n_ch    = wf.getnchannels()
+            sw      = wf.getsampwidth()
+            n_frames = wf.getnframes()
+            if n_frames == 0 or sw not in (1, 2, 3, 4):
+                return None
+            chunk = max(1, n_frames // n_peaks)
+            fmt   = {1: "B", 2: "h", 4: "i"}.get(sw)
+            if fmt is None:
+                return None
+            scale = {1: 128.0, 2: 32768.0, 4: 2147483648.0}[sw]
+            peaks: List[float] = []
+            for _ in range(n_peaks):
+                raw = wf.readframes(chunk)
+                if not raw:
+                    break
+                n_samples = len(raw) // sw
+                if n_samples == 0:
+                    peaks.append(0.0)
+                    continue
+                try:
+                    samples = struct.unpack_from(f"<{n_samples}{fmt}", raw)
+                    # Mix channels → mono peak
+                    mono = [sum(samples[i:i+n_ch]) / n_ch for i in range(0, n_samples, n_ch)]
+                    peak = max(abs(s) for s in mono) / scale if mono else 0.0
+                    peaks.append(min(1.0, peak))
+                except struct.error:
+                    peaks.append(0.0)
+        return peaks if peaks else None
+    except Exception:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CRYSTAL BIOLUMINESCENCE PALETTE
+# ═══════════════════════════════════════════════════════════════════════════
+
+C = {
+    # Backgrounds — layers of dark void
+    "void":      "#030308",   # main window background
+    "abyss":     "#060A18",   # panel backgrounds
+    "deep":      "#0A0E22",   # widget backgrounds
+    "surface":   "#0E1430",   # hover / elevated surface
+
+    # Neon crystal accents
+    "cyan":      "#00E5FF",   # primary — electric crystal blue
+    "pink":      "#FF2D9E",   # secondary — alien blossom magenta
+    "purple":    "#9945FF",   # tertiary — deep crystal purple
+    "lime":      "#39FF14",   # active / playing — bioluminescent green
+    "gold":      "#FFD700",   # markers / special — rare crystal gold
+    "orange":    "#FF6B2B",   # warning / record
+
+    # Text
+    "text":      "#C8E6FF",   # primary text — ice white-blue
+    "text_dim":  "#3D5A80",   # secondary text — muted ocean blue
+
+    # Track neons (per-lane colour sequence)
+    "tracks": [
+        "#00E5FF",  # 0  cyan
+        "#FF2D9E",  # 1  hot pink
+        "#39FF14",  # 2  lime
+        "#FFD700",  # 3  gold
+        "#9945FF",  # 4  purple
+        "#FF6B2B",  # 5  orange
+        "#00FFB3",  # 6  teal
+        "#FF4444",  # 7  red
+        "#44AAFF",  # 8  sky blue
+        "#FF88CC",  # 9  light pink
+        "#AAFF44",  # 10 yellow-green
+        "#FF8844",  # 11 amber
+        "#AA44FF",  # 12 violet
+        "#44FFAA",  # 13 mint
+        "#FF4488",  # 14 rose
+        "#44FFFF",  # 15 aqua
+    ],
+}
+
+STYLESHEET = f"""
+/* ─── Global ─────────────────────────────────────────────────────────── */
+QMainWindow, QWidget {{
+    background-color: {C["void"]};
+    color: {C["text"]};
+    font-family: 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif;
+    font-size: 13px;
+}}
+QDockWidget {{
+    background: {C["abyss"]};
+    titlebar-close-icon: none;
+}}
+QDockWidget::title {{
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+        stop:0 {C["deep"]}, stop:1 {C["abyss"]});
+    padding: 5px 10px;
+    font-weight: bold; font-size: 11px; letter-spacing: 2px;
+    color: {C["cyan"]};
+    border-bottom: 1px solid rgba(0,229,255,0.3);
+}}
+
+/* ─── Buttons ─────────────────────────────────────────────────────────── */
+QPushButton {{
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+        stop:0 {C["surface"]}, stop:1 {C["deep"]});
+    color: {C["text"]};
+    border: 1px solid rgba(0,229,255,0.25);
+    border-radius: 5px;
+    padding: 5px 14px;
+    font-size: 12px; letter-spacing: 0.5px;
+}}
+QPushButton:hover {{
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+        stop:0 rgba(0,229,255,0.18), stop:1 rgba(0,229,255,0.08));
+    border: 1px solid rgba(0,229,255,0.7);
+    color: {C["cyan"]};
+}}
+QPushButton:pressed {{
+    background: rgba(0,229,255,0.25);
+    border: 1px solid {C["cyan"]};
+}}
+QPushButton:checked {{
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+        stop:0 rgba(255,45,158,0.4), stop:1 rgba(255,45,158,0.15));
+    border: 1px solid {C["pink"]};
+    color: {C["pink"]};
+}}
+
+/* ─── Sliders ─────────────────────────────────────────────────────────── */
+QSlider::groove:horizontal {{
+    height: 3px;
+    background: rgba(0,229,255,0.12);
+    border-radius: 1px;
+}}
+QSlider::sub-page:horizontal {{
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+        stop:0 {C["purple"]}, stop:1 {C["cyan"]});
+    border-radius: 1px;
+}}
+QSlider::handle:horizontal {{
+    background: {C["cyan"]};
+    border: 2px solid {C["abyss"]};
+    width: 13px; height: 13px;
+    border-radius: 7px; margin: -5px 0;
+}}
+QSlider::groove:vertical {{
+    width: 3px;
+    background: rgba(0,229,255,0.12);
+    border-radius: 1px;
+}}
+QSlider::sub-page:vertical {{
+    background: qlineargradient(x1:0,y1:1,x2:0,y2:0,
+        stop:0 {C["purple"]}, stop:1 {C["cyan"]});
+    border-radius: 1px;
+}}
+QSlider::handle:vertical {{
+    background: {C["cyan"]};
+    border: 2px solid {C["abyss"]};
+    width: 13px; height: 13px;
+    border-radius: 7px; margin: 0 -5px;
+}}
+
+/* ─── Combos / Spinboxes ─────────────────────────────────────────────── */
+QComboBox, QSpinBox, QDoubleSpinBox {{
+    background: {C["deep"]};
+    border: 1px solid rgba(0,229,255,0.2);
+    border-radius: 4px; padding: 3px 8px;
+    color: {C["text"]};
+}}
+QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{
+    border-color: rgba(0,229,255,0.6);
+}}
+QComboBox::drop-down {{ border: none; }}
+QComboBox QAbstractItemView {{
+    background: {C["deep"]};
+    border: 1px solid rgba(0,229,255,0.3);
+    selection-background-color: rgba(0,229,255,0.2);
+    color: {C["text"]};
+}}
+
+/* ─── Scroll bars ────────────────────────────────────────────────────── */
+QScrollBar:vertical {{
+    background: {C["abyss"]}; width: 7px; border-radius: 3px;
+}}
+QScrollBar::handle:vertical {{
+    background: rgba(0,229,255,0.3); border-radius: 3px; min-height: 20px;
+}}
+QScrollBar:horizontal {{
+    background: {C["abyss"]}; height: 7px; border-radius: 3px;
+}}
+QScrollBar::handle:horizontal {{
+    background: rgba(0,229,255,0.3); border-radius: 3px; min-width: 20px;
+}}
+QScrollBar::add-line, QScrollBar::sub-line {{ border: none; background: none; }}
+
+/* ─── List widgets ───────────────────────────────────────────────────── */
+QListWidget {{
+    background: {C["deep"]}; border: 1px solid rgba(0,229,255,0.18);
+    border-radius: 4px; color: {C["text"]}; outline: none;
+}}
+QListWidget::item:selected {{
+    background: rgba(0,229,255,0.2);
+    color: {C["cyan"]};
+}}
+QListWidget::item:hover {{
+    background: rgba(0,229,255,0.08);
+}}
+
+/* ─── Line edit ──────────────────────────────────────────────────────── */
+QLineEdit {{
+    background: {C["deep"]}; border: 1px solid rgba(0,229,255,0.2);
+    border-radius: 4px; padding: 5px 10px; color: {C["text"]};
+}}
+QLineEdit:focus {{ border-color: rgba(0,229,255,0.6); }}
+
+/* ─── Group box ──────────────────────────────────────────────────────── */
+QGroupBox {{
+    border: 1px solid rgba(0,229,255,0.2);
+    border-radius: 6px; margin-top: 10px; padding-top: 6px;
+    color: {C["text_dim"]}; font-size: 11px; letter-spacing: 1px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin; left: 10px; padding: 0 5px;
+    color: rgba(0,229,255,0.7);
+}}
+
+/* ─── Status bar ─────────────────────────────────────────────────────── */
+QStatusBar {{
+    background: {C["abyss"]};
+    border-top: 1px solid rgba(0,229,255,0.1);
+}}
+QStatusBar QLabel {{ padding: 0 8px; }}
+
+/* ─── Tool bar ───────────────────────────────────────────────────────── */
+QToolBar {{
+    background: {C["abyss"]};
+    border-bottom: 1px solid rgba(0,229,255,0.15);
+    spacing: 4px; padding: 3px 6px;
+}}
+QToolBar::separator {{
+    background: rgba(0,229,255,0.15); width: 1px; margin: 4px 6px;
+}}
+
+/* ─── Checkboxes ─────────────────────────────────────────────────────── */
+QCheckBox {{ color: {C["text"]}; spacing: 6px; }}
+QCheckBox::indicator {{
+    width: 14px; height: 14px;
+    border: 1px solid rgba(0,229,255,0.4); border-radius: 3px;
+    background: {C["deep"]};
+}}
+QCheckBox::indicator:checked {{
+    background: {C["cyan"]};
+    border-color: {C["cyan"]};
+}}
+
+/* ─── Dial ───────────────────────────────────────────────────────────── */
+QDial {{
+    background: transparent;
+}}
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Utility widget: labelled vertical slider
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _make_vslider(min_val: int, max_val: int, init: int,
+                  parent: QWidget = None) -> QSlider:
+    s = QSlider(Qt.Vertical, parent)
+    s.setRange(min_val, max_val)
+    s.setValue(init)
+    s.setFixedHeight(80)
+    return s
+
+
+def _make_hslider(min_val: int, max_val: int, init: int,
+                  parent: QWidget = None) -> QSlider:
+    s = QSlider(Qt.Horizontal, parent)
+    s.setRange(min_val, max_val)
+    s.setValue(init)
+    return s
+
+
+def _label(text: str, color: str = C["text_dim"],
+           size: int = 10, bold: bool = False) -> QLabel:
+    lbl = QLabel(text)
+    weight = "bold" if bold else "normal"
+    lbl.setStyleSheet(
+        f"color:{color}; font-size:{size}px; font-weight:{weight};"
+        " background:transparent; letter-spacing:0.5px;"
+    )
+    lbl.setAlignment(Qt.AlignCenter)
+    return lbl
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Effects Panel
+# ═══════════════════════════════════════════════════════════════════════════
+
+class EffectsPanel(QWidget):
+    """
+    Per-instrument DSP effects panel.
+
+    Sections (top → bottom):
+        EQ       — 5 vertical band sliders with a curve display area.
+        Reverb   — Room, Damp, Width, Level sliders + enable toggle.
+        Compressor — Threshold, Ratio, Attack, Release + enable toggle.
+        Chorus   — Level, Speed, Depth + enable toggle.
+
+    All control changes call `_push()` which applies them to FluidSynth
+    immediately via the EffectChain.apply() route.
+    """
+
+    effect_changed = Signal()  # emitted whenever any parameter changes
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._chain: Optional[EffectChain] = None
+        self._engine: Optional[AudioEngine] = None
+        self._building = True
+
+        self.setFixedWidth(220)
+        self.setStyleSheet(f"background:{C['abyss']};")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        # ── Track label ────────────────────────────────────────────────
+        self._track_label = _label("No track selected", C["cyan"], 11, True)
+        root.addWidget(self._track_label)
+
+        # ── EQ section ────────────────────────────────────────────────
+        eq_grp = self._make_group("EQ — 5 BAND")
+        eq_inner = QVBoxLayout(eq_grp)
+        eq_inner.setContentsMargins(4, 4, 4, 4)
+        eq_inner.setSpacing(2)
+
+        self._eq_enable = QCheckBox("Active")
+        self._eq_enable.setChecked(True)
+        self._eq_enable.toggled.connect(self._push)
+        eq_inner.addWidget(self._eq_enable)
+
+        # 5 band sliders in a row
+        bands_widget = QWidget()
+        bands_layout = QHBoxLayout(bands_widget)
+        bands_layout.setContentsMargins(0, 0, 0, 0)
+        bands_layout.setSpacing(4)
+        self._eq_sliders: List[QSlider] = []
+        for freq_label in ["32", "250", "1k", "4k", "16k"]:
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            sl = _make_vslider(-24, 24, 0)
+            sl.valueChanged.connect(self._push)
+            self._eq_sliders.append(sl)
+            col.addWidget(sl, alignment=Qt.AlignCenter)
+            col.addWidget(_label(freq_label, C["text_dim"], 9))
+            bands_layout.addLayout(col)
+
+        eq_inner.addWidget(bands_widget)
+        eq_grp.setLayout(eq_inner)
+        root.addWidget(eq_grp)
+
+        # ── Reverb section ─────────────────────────────────────────────
+        rev_grp = self._make_group("REVERB")
+        rev_inner = QVBoxLayout(rev_grp)
+        rev_inner.setContentsMargins(4, 4, 4, 4)
+        rev_inner.setSpacing(4)
+
+        self._rev_enable = QCheckBox("Active")
+        self._rev_enable.setChecked(True)
+        self._rev_enable.toggled.connect(self._push)
+        rev_inner.addWidget(self._rev_enable)
+
+        self._rev_room  = self._make_param_row(rev_inner, "Room",  0, 100, 50)
+        self._rev_damp  = self._make_param_row(rev_inner, "Damp",  0, 100, 40)
+        self._rev_width = self._make_param_row(rev_inner, "Width", 0, 100, 70)
+        self._rev_level = self._make_param_row(rev_inner, "Level", 0, 100, 25)
+
+        rev_grp.setLayout(rev_inner)
+        root.addWidget(rev_grp)
+
+        # ── Compressor section ─────────────────────────────────────────
+        comp_grp = self._make_group("COMPRESSOR")
+        comp_inner = QVBoxLayout(comp_grp)
+        comp_inner.setContentsMargins(4, 4, 4, 4)
+        comp_inner.setSpacing(4)
+
+        self._comp_enable = QCheckBox("Active")
+        self._comp_enable.setChecked(False)
+        self._comp_enable.toggled.connect(self._push)
+        comp_inner.addWidget(self._comp_enable)
+
+        self._comp_thresh  = self._make_param_row(comp_inner, "Thresh", 0, 127, 90)
+        self._comp_ratio   = self._make_param_row(comp_inner, "Ratio",  1,  20,  4)
+        self._comp_attack  = self._make_param_row(comp_inner, "Attack", 1, 200, 10)
+        self._comp_release = self._make_param_row(comp_inner, "Rel.",   1, 500,100)
+
+        comp_grp.setLayout(comp_inner)
+        root.addWidget(comp_grp)
+
+        # ── Chorus section ─────────────────────────────────────────────
+        cho_grp = self._make_group("CHORUS")
+        cho_inner = QVBoxLayout(cho_grp)
+        cho_inner.setContentsMargins(4, 4, 4, 4)
+        cho_inner.setSpacing(4)
+
+        self._cho_enable = QCheckBox("Active")
+        self._cho_enable.setChecked(False)
+        self._cho_enable.toggled.connect(self._push)
+        cho_inner.addWidget(self._cho_enable)
+
+        self._cho_level = self._make_param_row(cho_inner, "Level", 0, 100, 30)
+        self._cho_speed = self._make_param_row(cho_inner, "Speed", 1,  50,  3)
+        self._cho_depth = self._make_param_row(cho_inner, "Depth", 0, 300, 80)
+
+        cho_grp.setLayout(cho_inner)
+        root.addWidget(cho_grp)
+
+        root.addStretch()
+        self._building = False
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _make_group(self, title: str) -> QGroupBox:
+        g = QGroupBox(title)
+        g.setStyleSheet(f"""
+            QGroupBox {{
+                border: 1px solid rgba(0,229,255,0.2);
+                border-radius: 6px; margin-top: 10px; padding-top: 6px;
+                color: rgba(0,229,255,0.6); font-size: 10px; letter-spacing: 1px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin; left: 8px; padding: 0 4px;
+            }}
+        """)
+        return g
+
+    def _make_param_row(self, layout: QVBoxLayout,
+                        label: str, lo: int, hi: int, init: int) -> QSlider:
+        """Add a labelled horizontal slider row and return the slider."""
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.addWidget(_label(label, C["text_dim"], 10))
+        sl = _make_hslider(lo, hi, init)
+        sl.valueChanged.connect(self._push)
+        row.addWidget(sl)
+        val_lbl = _label(str(init), C["cyan"], 9)
+        sl.valueChanged.connect(lambda v, l=val_lbl: l.setText(str(v)))
+        row.addWidget(val_lbl)
+        layout.addLayout(row)
+        return sl
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def load_chain(
+        self, chain: EffectChain, engine: AudioEngine, track_name: str
+    ) -> None:
+        """Switch the panel to display and edit a different EffectChain."""
+        self._chain  = chain
+        self._engine = engine
+        self._track_label.setText(f"✦  {track_name}")
+        self._building = True   # suppress _push() during load
+
+        # EQ
+        self._eq_enable.setChecked(chain.eq_enabled)
+        vals = [chain.eq_32, chain.eq_250, chain.eq_1k, chain.eq_4k, chain.eq_16k]
+        for sl, v in zip(self._eq_sliders, vals):
+            sl.setValue(int(v * 2))   # ±12 dB → ±24 slider units
+
+        # Reverb
+        self._rev_enable.setChecked(chain.reverb_enabled)
+        self._rev_room .setValue(int(chain.reverb_room  * 100))
+        self._rev_damp .setValue(int(chain.reverb_damp  * 100))
+        self._rev_width.setValue(int(chain.reverb_width * 100))
+        self._rev_level.setValue(int(chain.reverb_level * 100))
+
+        # Compressor
+        self._comp_enable .setChecked(chain.comp_enabled)
+        self._comp_thresh .setValue(int(chain.comp_threshold))
+        self._comp_ratio  .setValue(int(chain.comp_ratio))
+        self._comp_attack .setValue(int(chain.comp_attack))
+        self._comp_release.setValue(int(chain.comp_release))
+
+        # Chorus
+        self._cho_enable.setChecked(chain.chorus_enabled)
+        self._cho_level .setValue(int(chain.chorus_level * 100))
+        self._cho_speed .setValue(int(chain.chorus_speed * 10))
+        self._cho_depth .setValue(int(chain.chorus_depth * 10))
+
+        self._building = False
+
+    # ------------------------------------------------------------------
+
+    def _push(self) -> None:
+        """Read all widget values into the EffectChain and apply to engine."""
+        if self._building or self._chain is None:
+            return
+
+        # EQ
+        self._chain.eq_enabled = self._eq_enable.isChecked()
+        db_vals = [sl.value() / 2.0 for sl in self._eq_sliders]
+        self._chain.eq_32, self._chain.eq_250, self._chain.eq_1k, \
+            self._chain.eq_4k, self._chain.eq_16k = db_vals
+
+        # Reverb
+        self._chain.reverb_enabled = self._rev_enable.isChecked()
+        self._chain.reverb_room    = self._rev_room .value() / 100.0
+        self._chain.reverb_damp    = self._rev_damp .value() / 100.0
+        self._chain.reverb_width   = self._rev_width.value() / 100.0
+        self._chain.reverb_level   = self._rev_level.value() / 100.0
+
+        # Compressor
+        self._chain.comp_enabled   = self._comp_enable .isChecked()
+        self._chain.comp_threshold = float(self._comp_thresh .value())
+        self._chain.comp_ratio     = float(self._comp_ratio  .value())
+        self._chain.comp_attack    = float(self._comp_attack .value())
+        self._chain.comp_release   = float(self._comp_release.value())
+
+        # Chorus
+        self._chain.chorus_enabled = self._cho_enable.isChecked()
+        self._chain.chorus_level   = self._cho_level.value() / 100.0
+        self._chain.chorus_speed   = self._cho_speed.value() / 10.0
+        self._chain.chorus_depth   = self._cho_depth.value() / 10.0
+
+        if self._engine:
+            self._engine.apply_effect_chain(self._chain)
+
+        self.effect_changed.emit()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Piano Roll Widget
+# ═══════════════════════════════════════════════════════════════════════════
+
+class PianoRollWidget(QWidget):
+    """
+    Scrollable MIDI grid with per-instrument focus and ghost-note display.
+
+    Focus mode (default):
+        Active track's notes are drawn vivid and fully interactive.
+        All other tracks' notes appear as semi-transparent ghost outlines
+        so you can see the full composition context without confusion.
+
+    Composition mode (toggle):
+        Every track is drawn at full brightness.  Useful for seeing how
+        all instrument lines fit together.
+    """
+
+    # ── Signals ───────────────────────────────────────────────────────────────
+    note_added          = Signal(int, float, float, int)  # ch, rel_beat, dur, pitch
+    note_removed        = Signal(int, int)                # ch, note_id
+    note_moved          = Signal(int, int, float, int)    # ch, note_id, new_rel_beat, new_pitch
+    note_resized        = Signal(int, int, float)         # ch, note_id, new_duration
+    loop_region_changed = Signal(float, float)            # start_beat, end_beat
+    seek_requested      = Signal(float)                   # beat position
+    scroll_x_changed    = Signal(float)                   # view_x
+    view_y_changed      = Signal(int)                     # _view_y (scrollbar sync)
+
+    BEAT_WIDTH:    int = 80
+    NOTE_HEIGHT:   int = 14
+    PITCH_MIN:     int = 0     # C-1 (full MIDI range)
+    PITCH_MAX:     int = 128   # exclusive upper bound (127 = G9)
+    HEADER_HEIGHT: int = 30
+    PIANO_WIDTH:   int = 52
+
+    # Mouse drag modes
+    _MODE_NONE   = "none"
+    _MODE_DRAW   = "draw"     # drawing a new note
+    _MODE_RESIZE = "resize"   # dragging right edge of a note
+    _MODE_MOVE   = "move"     # dragging note body / selected notes
+    _MODE_LASSO  = "lasso"    # rubber-band selection rectangle
+
+    # Width in pixels of the right-edge resize handle on each note
+    RESIZE_GRIP = 8
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        # ── Display data ──────────────────────────────────────────────────
+        self._tracks:         List[MidiTrack] = []
+        self._channel_colors: Dict[int, QColor] = {}
+        self._active_channel: int   = 0
+        self._total_beats:    float = 32.0
+        self._composition_mode: bool = False
+        self._active_clip:    Optional[MidiClip] = None  # clip currently edited
+
+        # ── Viewport state ────────────────────────────────────────────────
+        self._view_x:   float = 0.0
+        self._view_y:   int   = 0
+        self._vy_accum: float = 0.0   # sub-step accumulator for trackpad scroll
+
+        # ── Selection ─────────────────────────────────────────────────────
+        self._selected_ids: set = set()   # set of note_id ints
+
+        # ── Drag state ────────────────────────────────────────────────────
+        self._drag_mode: str = self._MODE_NONE
+
+        # Draw mode (left-drag on empty area → new note)
+        self._draw_start: Optional[Tuple[float, int]] = None
+
+        # Resize mode (drag right edge of a note)
+        self._resize_note_id:       int   = -1
+        self._resize_orig_duration: float = 1.0
+
+        # Move mode (drag body of a note or the selection)
+        self._move_origin_beat:   float = 0.0   # beat at drag start
+        self._move_origin_pitch:  int   = 0     # pitch at drag start
+        self._move_notes_state:   Dict[int, Tuple[float, int]] = {}
+        #   note_id → (original_rel_beat, original_pitch)
+
+        # Lasso mode (shift+drag or drag on empty area)
+        self._lasso_start: Optional[QPointF] = None
+        self._lasso_end:   Optional[QPointF] = None
+
+        # Last click beat position — used as paste target for Cmd+V
+        self._last_click_beat: float = 0.0
+
+        # ── Loop region ───────────────────────────────────────────────────
+        self._loop_enabled:    bool  = False
+        self._loop_start:      float = 0.0
+        self._loop_end:        float = 8.0
+        self._loop_drag_origin: Optional[float] = None
+
+        # Ruler press tracking (click = seek, drag = loop)
+        self._ruler_pressed:    bool  = False
+        self._ruler_press_x:    int   = 0
+        self._ruler_press_beat: float = 0.0
+
+        # Edit mode: "draw" (default) or "select"
+        self._edit_mode: str = "draw"
+
+        self.setMinimumSize(640, 400)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
+        self.setStyleSheet(f"background:{C['void']};")
+
+    # ------------------------------------------------------------------
+    # Qt overrides
+    # ------------------------------------------------------------------
+
+    def showEvent(self, event) -> None:
+        """Reset view_x when the piano roll becomes visible after being hidden."""
+        super().showEvent(event)
+        if self._active_clip is not None:
+            self._view_x = 0.0
+        self.update()
+
+    def keyPressEvent(self, ev) -> None:
+        """Explicitly ignore key events so they propagate to the main window."""
+        ev.ignore()
+
+    def keyReleaseEvent(self, ev) -> None:
+        """Explicitly ignore key events so they propagate to the main window."""
+        ev.ignore()
+
+    # ------------------------------------------------------------------
+    # Public
+    # ------------------------------------------------------------------
+
+    def set_tracks(self, tracks: List[MidiTrack]) -> None:
+        self._tracks = tracks
+        self._channel_colors = {t.channel: QColor(t.color) for t in tracks}
+        self.update()
+
+    def set_active_channel(self, ch: int) -> None:
+        self._active_channel = ch
+        self.update()
+
+    def set_composition_mode(self, on: bool) -> None:
+        self._composition_mode = on
+        self.update()
+
+    def set_total_beats(self, beats: float) -> None:
+        self._total_beats = beats
+        self.update()
+
+    def set_loop_region(self, enabled: bool, start: float, end: float) -> None:
+        self._loop_enabled = enabled
+        self._loop_start   = start
+        self._loop_end     = end
+        self.update()
+
+    def set_edit_mode(self, mode: str) -> None:
+        """Switch between 'draw' (pencil) and 'select' (lasso) mode."""
+        self._edit_mode = mode
+        self._drag_mode = self._MODE_NONE
+        self.setCursor(Qt.CrossCursor if mode == "draw" else Qt.ArrowCursor)
+
+    def set_view_x(self, vx: float) -> None:
+        self._view_x = max(0.0, vx)
+        self.update()
+
+    def set_active_clip(self, clip: Optional[MidiClip]) -> None:
+        """
+        Set the MidiClip whose notes the piano roll edits.
+
+        When a clip is set the piano roll shows only that clip's notes at
+        their relative positions (beat 0 = clip start).  Pass None to return
+        to the legacy flat-track display.
+        """
+        self._active_clip = clip
+        self._selected_ids.clear()
+        self._drag_mode = self._MODE_NONE
+        if clip is not None:
+            # Always start at beat 0 of the clip regardless of arrangement scroll
+            self._view_x = 0.0
+            # Scroll vertically to the note range (or middle C if the clip is empty)
+            if clip.notes:
+                avg = sum(n.pitch for n in clip.notes) / len(clip.notes)
+                self.jump_to_pitch(int(avg))
+            else:
+                self.jump_to_pitch(60)
+        self.update()
+
+    def jump_to_pitch(self, pitch: int) -> None:
+        """
+        Scroll the piano roll so *pitch* appears near the top of the viewport.
+
+        view_y = 0 → topmost visible row is pitch 127 (G9).
+        Increasing view_y shifts the view downward (toward lower notes).
+        We place the target pitch 4 rows below the top edge for context.
+        """
+        target_top = pitch + 4
+        self._view_y = max(0, self.PITCH_MAX - 1 - target_top)
+        self.view_y_changed.emit(self._view_y)
+        self.update()
+
+    # ------------------------------------------------------------------
+    # Painting
+    # ------------------------------------------------------------------
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        gw = w - self.PIANO_WIDTH
+        gh = h - self.HEADER_HEIGHT
+
+        self._draw_bg(p, w, h)
+        self._draw_piano(p, gh)
+        self._draw_ruler(p, gw)
+        self._draw_grid(p, gw, gh)
+        self._draw_notes(p, gw, gh)
+        self._draw_playhead(p, gw, gh)
+
+    def _draw_bg(self, p: QPainter, w: int, h: int) -> None:
+        p.fillRect(0, 0, w, h, QColor(C["void"]))
+
+    def _draw_piano(self, p: QPainter, gh: int) -> None:
+        p.save()
+        p.translate(0, self.HEADER_HEIGHT)
+        num = self.PITCH_MAX - self.PITCH_MIN
+
+        for i in range(num):
+            pitch = self.PITCH_MAX - 1 - i - self._view_y
+            if not (self.PITCH_MIN <= pitch < self.PITCH_MAX):
+                continue
+            y = i * self.NOTE_HEIGHT
+            if y > gh:
+                break
+            is_black = pitch % 12 in {1, 3, 6, 8, 10}
+            if is_black:
+                p.fillRect(0, y, self.PIANO_WIDTH - 2, self.NOTE_HEIGHT - 1,
+                           QColor(15, 18, 35))
+            else:
+                grad = QLinearGradient(0, y, self.PIANO_WIDTH, y)
+                grad.setColorAt(0, QColor(30, 40, 65))
+                grad.setColorAt(1, QColor(20, 26, 50))
+                p.fillRect(0, y, self.PIANO_WIDTH - 2, self.NOTE_HEIGHT - 1,
+                           QBrush(grad))
+
+            if pitch % 12 == 0:
+                p.setPen(QColor(C["cyan"]))
+                p.setFont(QFont("Arial", 7))
+                p.drawText(3, y + self.NOTE_HEIGHT - 2, f"C{pitch//12 - 1}")
+
+        p.restore()
+
+    def _draw_ruler(self, p: QPainter, gw: int) -> None:
+        p.save()
+        p.translate(self.PIANO_WIDTH, 0)
+        p.fillRect(0, 0, gw, self.HEADER_HEIGHT, QColor(C["abyss"]))
+
+        # Loop region highlight on ruler
+        if self._loop_enabled or self._loop_drag_origin is not None:
+            xs = int((self._loop_start - self._view_x) * self.BEAT_WIDTH)
+            xe = int((self._loop_end   - self._view_x) * self.BEAT_WIDTH)
+            if xs < gw and xe > 0:
+                fill_x = max(0, xs)
+                fill_w = min(gw, xe) - fill_x
+                p.fillRect(fill_x, 0, fill_w, self.HEADER_HEIGHT,
+                           QColor(153, 69, 255, 50))
+                p.setPen(QPen(QColor(C["purple"]), 2))
+                if 0 <= xs <= gw:
+                    p.drawLine(xs, 0, xs, self.HEADER_HEIGHT)
+                if 0 <= xe <= gw:
+                    p.drawLine(xe, 0, xe, self.HEADER_HEIGHT)
+
+        # Glowing bottom border on ruler
+        p.setPen(QPen(QColor(0, 229, 255, 60), 1))
+        p.drawLine(0, self.HEADER_HEIGHT - 1, gw, self.HEADER_HEIGHT - 1)
+
+        p.setFont(QFont("Arial", 9))
+        beat = 0
+        while beat <= self._total_beats:
+            x = int((beat - self._view_x) * self.BEAT_WIDTH)
+            if 0 <= x <= gw:
+                if beat % 4 == 0:
+                    p.setPen(QColor(C["cyan"]))
+                    p.drawText(x + 3, self.HEADER_HEIGHT - 5,
+                               f"BAR {int(beat//4)+1}")
+                else:
+                    p.setPen(QPen(QColor(0, 229, 255, 40), 1))
+                    p.drawLine(x, 22, x, self.HEADER_HEIGHT - 1)
+            beat += 1
+
+        # Hint label when no loop is set yet
+        if not self._loop_enabled and self._loop_drag_origin is None:
+            p.setPen(QColor(C["text_dim"]))
+            p.setFont(QFont("Arial", 8))
+            p.drawText(4, self.HEADER_HEIGHT - 4, "drag ruler → set loop")
+
+        p.restore()
+
+    def _draw_grid(self, p: QPainter, gw: int, gh: int) -> None:
+        p.save()
+        p.translate(self.PIANO_WIDTH, self.HEADER_HEIGHT)
+        num = self.PITCH_MAX - self.PITCH_MIN
+
+        for i in range(num):
+            pitch = self.PITCH_MAX - 1 - i - self._view_y
+            if not (self.PITCH_MIN <= pitch < self.PITCH_MAX):
+                continue
+            y = i * self.NOTE_HEIGHT
+            if y > gh:
+                break
+            is_black = pitch % 12 in {1, 3, 6, 8, 10}
+            # Crystal dark rows — black-key rows are slightly more purple
+            r = QColor(8, 10, 22) if is_black else QColor(10, 13, 28)
+            p.fillRect(0, y, gw, self.NOTE_HEIGHT, r)
+
+            # C-note separator line
+            if pitch % 12 == 0:
+                p.setPen(QPen(QColor(0, 229, 255, 25), 1))
+                p.drawLine(0, y, gw, y)
+
+        # Vertical beat lines — bar lines bright, sub-grid lines faint
+        grid_step = getattr(self, "_grid_beats", 0.25)
+        b = 0.0
+        while b <= self._total_beats + grid_step:
+            x = int((b - self._view_x) * self.BEAT_WIDTH)
+            if 0 <= x <= gw:
+                if abs(b % 4) < 0.001 or abs(b % 4 - 4) < 0.001:
+                    p.setPen(QPen(QColor(0, 229, 255, 35), 1))
+                elif abs(b % 1) < 0.001:
+                    p.setPen(QPen(QColor(0, 229, 255, 18), 1))
+                else:
+                    p.setPen(QPen(QColor(0, 229, 255, 8), 1))
+                p.drawLine(x, 0, x, gh)
+            b = round(b + grid_step, 6)
+
+        p.restore()
+
+    def _clip_notes_for_display(self) -> Tuple[List[MidiNote], QColor, bool]:
+        """
+        Return (notes, base_color, is_clip_mode).
+
+        In clip mode: returns the active clip's relative notes and the track color.
+        In legacy mode: returns all tracks' absolute notes.
+        """
+        if self._active_clip is not None:
+            color = self._channel_colors.get(
+                self._active_channel, QColor(C["cyan"]))
+            return self._active_clip.notes, color, True
+
+        # Legacy: flat list from the active track (only)
+        for track in self._tracks:
+            if track.channel == self._active_channel:
+                color = self._channel_colors.get(track.channel, QColor(C["cyan"]))
+                return track.notes, color, False
+        return [], QColor(C["cyan"]), False
+
+    def _note_screen_rect(self, note: MidiNote) -> QRectF:
+        """
+        Return the note's rectangle in the piano-roll coordinate system
+        (translated so origin is at PIANO_WIDTH, HEADER_HEIGHT).
+        """
+        x  = (note.start_beat - self._view_x) * self.BEAT_WIDTH
+        nw = max(4.0, note.duration * self.BEAT_WIDTH - 2)
+        row = (self.PITCH_MAX - note.pitch - 1) - self._view_y
+        y   = row * self.NOTE_HEIGHT
+        return QRectF(x, y + 1, nw, self.NOTE_HEIGHT - 2)
+
+    def _find_note_at_screen(
+        self, sx: int, sy: int
+    ) -> Tuple[Optional[MidiNote], str]:
+        """
+        Hit-test screen position (sx, sy) against rendered notes.
+
+        Returns (note, zone) where zone is 'resize' (right edge) or 'body',
+        or (None, '') if no note is under the cursor.
+        The coordinates are relative to the note-grid area (after header/piano offset).
+        """
+        notes, _, _ = self._clip_notes_for_display()
+        for note in reversed(notes):
+            r = self._note_screen_rect(note)
+            if r.contains(sx, sy):
+                zone = ('resize'
+                        if sx >= r.right() - self.RESIZE_GRIP
+                        else 'body')
+                return note, zone
+        return None, ''
+
+    def _draw_notes(self, p: QPainter, gw: int, gh: int) -> None:
+        p.save()
+        p.translate(self.PIANO_WIDTH, self.HEADER_HEIGHT)
+
+        notes, color, is_clip_mode = self._clip_notes_for_display()
+
+        # When in move mode, compute preview offsets so notes follow the mouse
+        delta_beat  = 0.0
+        delta_pitch = 0
+        if self._drag_mode == self._MODE_MOVE and self._move_notes_state:
+            delta_beat  = self._move_origin_beat  - 0.0   # computed in mouseMoveEvent
+            delta_pitch = self._move_origin_pitch - 0
+            # Actual deltas are stored in _move_origin_* as the CURRENT position
+            # (we overwrite them in mouseMoveEvent as the preview offsets)
+            delta_beat  = getattr(self, '_move_delta_beat',  0.0)
+            delta_pitch = getattr(self, '_move_delta_pitch', 0)
+
+        # Ghost notes from other tracks in composition mode (legacy path)
+        if self._composition_mode and not is_clip_mode:
+            for track in self._tracks:
+                if track.channel == self._active_channel:
+                    continue
+                ghost_col = self._channel_colors.get(
+                    track.channel, QColor(C["cyan"]))
+                for note in track.notes:
+                    r = self._note_screen_rect(note)
+                    if r.right() < 0 or r.x() > gw:
+                        continue
+                    p.setPen(QPen(
+                        QColor(ghost_col.red(), ghost_col.green(),
+                               ghost_col.blue(), 50), 1))
+                    p.setBrush(
+                        QColor(ghost_col.red(), ghost_col.green(),
+                               ghost_col.blue(), 15))
+                    p.drawRoundedRect(r, 2, 2)
+
+        # Active notes
+        for note in notes:
+            is_selected = note.note_id in self._selected_ids
+            is_moving   = (self._drag_mode == self._MODE_MOVE
+                           and note.note_id in self._move_notes_state)
+
+            # Compute display position (with live move preview)
+            disp_note_beat  = note.start_beat
+            disp_note_pitch = note.pitch
+            disp_duration   = note.duration
+
+            if is_moving:
+                disp_note_beat  = max(0.0, note.start_beat + delta_beat)
+                disp_note_pitch = max(0, min(127, note.pitch + delta_pitch))
+            elif (self._drag_mode == self._MODE_RESIZE
+                  and note.note_id == self._resize_note_id):
+                disp_duration = max(0.0625, getattr(self, '_resize_preview_dur',
+                                                    note.duration))
+
+            x  = (disp_note_beat - self._view_x) * self.BEAT_WIDTH
+            nw = max(4.0, disp_duration * self.BEAT_WIDTH - 2)
+            row = (self.PITCH_MAX - disp_note_pitch - 1) - self._view_y
+            y   = row * self.NOTE_HEIGHT
+
+            if x + nw < 0 or x > gw or y + self.NOTE_HEIGHT < 0 or y > gh:
+                continue
+
+            rect = QRectF(x, y + 1, nw, self.NOTE_HEIGHT - 2)
+
+            if is_selected or is_moving:
+                # Selection highlight: white inner border + brighter body
+                grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+                grad.setColorAt(0, color.lighter(220))
+                grad.setColorAt(0.5, color.lighter(150))
+                grad.setColorAt(1, color)
+                p.fillRect(rect, QBrush(grad))
+                p.setPen(QPen(QColor(255, 255, 255, 220), 1.5))
+                p.drawRoundedRect(rect, 2, 2)
+            else:
+                grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+                grad.setColorAt(0, color.lighter(170))
+                grad.setColorAt(0.5, color)
+                grad.setColorAt(1, color.darker(140))
+                p.fillRect(rect, QBrush(grad))
+                p.setPen(QPen(color.lighter(200), 1))
+                p.drawRoundedRect(rect, 2, 2)
+
+                glow = QRectF(x + 1, y + 2, max(2.0, nw - 2), 2)
+                p.fillRect(glow, QColor(255, 255, 255, 60))
+
+            # Resize grip indicator: a thin bright line on the right edge
+            if nw > self.RESIZE_GRIP + 2:
+                p.setPen(QPen(QColor(255, 255, 255, 100), 2))
+                p.drawLine(QPointF(x + nw - 1, y + 2),
+                           QPointF(x + nw - 1, y + self.NOTE_HEIGHT - 3))
+
+        # Lasso rectangle
+        if self._drag_mode == self._MODE_LASSO and self._lasso_start and self._lasso_end:
+            lx = min(self._lasso_start.x(), self._lasso_end.x()) - self.PIANO_WIDTH
+            ly = min(self._lasso_start.y(), self._lasso_end.y()) - self.HEADER_HEIGHT
+            lw = abs(self._lasso_end.x() - self._lasso_start.x())
+            lh = abs(self._lasso_end.y() - self._lasso_start.y())
+            p.setPen(QPen(QColor(0, 229, 255, 200), 1, Qt.DashLine))
+            p.setBrush(QColor(0, 229, 255, 20))
+            p.drawRect(QRectF(lx, ly, lw, lh))
+
+        p.restore()
+
+    def _draw_playhead(self, p: QPainter, gw: int, gh: int) -> None:
+        """Animated neon line showing current playback position."""
+        pass   # Playhead x is updated from MainWindow._on_refresh_tick
+
+    # ------------------------------------------------------------------
+    # Mouse interaction
+    # ------------------------------------------------------------------
+
+    def _to_beat_pitch(self, x: int, y: int) -> Tuple[float, int]:
+        beat  = (x - self.PIANO_WIDTH) / self.BEAT_WIDTH + self._view_x
+        pitch = (self.PITCH_MAX - 1
+                 - int((y - self.HEADER_HEIGHT) / self.NOTE_HEIGHT)
+                 - self._view_y)
+        return beat, pitch
+
+    # ── Internal helpers ──────────────────────────────────────────────────
+
+    def _grid_coords(self, sx: int, sy: int) -> Tuple[float, int]:
+        """
+        Convert screen position (sx, sy) to (beat, pitch) grid coordinates.
+
+        Beat is relative to view_x; pitch is the MIDI note number.
+        """
+        beat  = (sx - self.PIANO_WIDTH) / self.BEAT_WIDTH + self._view_x
+        pitch = (self.PITCH_MAX - 1
+                 - int((sy - self.HEADER_HEIGHT) / self.NOTE_HEIGHT)
+                 - self._view_y)
+        return beat, pitch
+
+    # Grid sizes: label → beat duration
+    GRID_SIZES = {
+        "1":    4.0,
+        "1/2":  2.0,
+        "1/4":  1.0,
+        "1/8":  0.5,
+        "1/16": 0.25,
+    }
+
+    def set_grid_size(self, label: str) -> None:
+        self._grid_beats = self.GRID_SIZES.get(label, 0.25)
+        self.update()
+
+    def _snap(self, beat: float) -> float:
+        g = getattr(self, "_grid_beats", 0.25)
+        inv = 1.0 / g
+        return max(0.0, round(beat * inv) / inv)
+
+    def _notes_in_lasso(self) -> set:
+        """Return the set of note_ids whose rects overlap the current lasso rect."""
+        if not (self._lasso_start and self._lasso_end):
+            return set()
+        lx1 = min(self._lasso_start.x(), self._lasso_end.x()) - self.PIANO_WIDTH
+        ly1 = min(self._lasso_start.y(), self._lasso_end.y()) - self.HEADER_HEIGHT
+        lx2 = max(self._lasso_start.x(), self._lasso_end.x()) - self.PIANO_WIDTH
+        ly2 = max(self._lasso_start.y(), self._lasso_end.y()) - self.HEADER_HEIGHT
+        lasso = QRectF(lx1, ly1, lx2 - lx1, ly2 - ly1)
+
+        notes, _, _ = self._clip_notes_for_display()
+        ids = set()
+        for note in notes:
+            r = self._note_screen_rect(note)
+            if lasso.intersects(r):
+                ids.add(note.note_id)
+        return ids
+
+    # ── Mouse events ──────────────────────────────────────────────────────
+
+    def mousePressEvent(self, ev) -> None:
+        # ── Ruler area: click = seek, drag = loop region ─────────────────
+        if ev.y() < self.HEADER_HEIGHT and ev.x() > self.PIANO_WIDTH:
+            if ev.button() == Qt.LeftButton:
+                beat = (ev.x() - self.PIANO_WIDTH) / self.BEAT_WIDTH + self._view_x
+                self._ruler_pressed    = True
+                self._ruler_press_x    = ev.x()
+                self._ruler_press_beat = max(0.0, round(beat * 4) / 4)
+                self._loop_drag_origin = None
+                self.update()
+            return
+
+        # ── Piano keyboard area: preview pitch ────────────────────────────
+        if ev.x() < self.PIANO_WIDTH:
+            return
+
+        # Translate screen coords to note-grid coords
+        gx = ev.x() - self.PIANO_WIDTH
+        gy = ev.y() - self.HEADER_HEIGHT
+        beat, pitch = self._grid_coords(ev.x(), ev.y())
+
+        # FIX: Force alignment for the very first interaction[cite: 9]
+        if self._active_clip is not None:
+            # Ensure we can't place notes at negative relative positions
+            beat = max(0.0, beat)
+
+        beat = self._snap(beat)
+        pitch = max(self.PITCH_MIN, min(self.PITCH_MAX - 1, pitch))
+
+        if ev.button() == Qt.RightButton:
+            # Right-click on a note → delete it
+            note, _ = self._find_note_at_screen(gx, gy)
+            if note:
+                self.note_removed.emit(self._active_channel, note.note_id)
+            return
+
+        if ev.button() == Qt.LeftButton:
+            # Track where the user clicked (used as paste target for Cmd+V).
+            self._last_click_beat = beat
+            note, zone = self._find_note_at_screen(gx, gy)
+
+            if note and zone == 'resize':
+                # ── Resize mode ──────────────────────────────────────────
+                self._drag_mode          = self._MODE_RESIZE
+                self._resize_note_id     = note.note_id
+                self._resize_orig_duration = note.duration
+                self._resize_preview_dur = note.duration
+
+            elif note and zone == 'body':
+                # ── Move mode ────────────────────────────────────────────
+                # If note is not already selected, clear selection and select it
+                if note.note_id not in self._selected_ids:
+                    self._selected_ids = {note.note_id}
+
+                self._drag_mode          = self._MODE_MOVE
+                self._move_origin_beat   = beat
+                self._move_origin_pitch  = pitch
+                self._move_delta_beat    = 0.0
+                self._move_delta_pitch   = 0
+
+                # Snapshot original positions of all notes being moved
+                notes, _, _ = self._clip_notes_for_display()
+                self._move_notes_state = {
+                    n.note_id: (n.start_beat, n.pitch)
+                    for n in notes
+                    if n.note_id in self._selected_ids
+                }
+
+            elif ev.modifiers() & Qt.ShiftModifier or self._edit_mode == "select":
+                # ── Lasso mode (Shift held, or SELECT mode active) ────────
+                self._drag_mode    = self._MODE_LASSO
+                self._lasso_start  = QPointF(ev.x(), ev.y())
+                self._lasso_end    = QPointF(ev.x(), ev.y())
+
+            else:
+                # ── Draw mode (empty area, no Shift, DRAW mode active) ────
+                self._selected_ids.clear()
+                self._drag_mode    = self._MODE_DRAW
+                self._draw_start   = (beat, pitch)
+
+        self.update()
+
+    def mouseMoveEvent(self, ev) -> None:
+        # ── Ruler: start loop drag once mouse moves > 4 px ───────────────
+        if self._ruler_pressed and abs(ev.x() - self._ruler_press_x) > 4:
+            if self._loop_drag_origin is None:
+                self._loop_drag_origin = self._ruler_press_beat
+                self._loop_start = self._loop_drag_origin
+                self._loop_end   = self._loop_drag_origin + 0.25
+
+        # ── Ruler drag (loop region) ──────────────────────────────────────
+        if self._loop_drag_origin is not None:
+            beat = (ev.x() - self.PIANO_WIDTH) / self.BEAT_WIDTH + self._view_x
+            beat = max(0.0, round(beat * 4) / 4)
+            origin = self._loop_drag_origin
+            self._loop_start = min(origin, beat)
+            self._loop_end   = max(origin + 0.25, beat)
+            self.update()
+            return
+
+        if self._drag_mode == self._MODE_RESIZE:
+            # Resize: compute new duration from cursor's beat position
+            cur_beat = self._snap(
+                (ev.x() - self.PIANO_WIDTH) / self.BEAT_WIDTH + self._view_x)
+            notes, _, _ = self._clip_notes_for_display()
+            note = next((n for n in notes if n.note_id == self._resize_note_id),
+                        None)
+            if note:
+                new_dur = max(0.25, cur_beat - note.start_beat)
+                self._resize_preview_dur = new_dur
+            self.update()
+
+        elif self._drag_mode == self._MODE_MOVE:
+            # Move: compute beat/pitch delta relative to drag origin
+            cur_beat, cur_pitch = self._grid_coords(ev.x(), ev.y())
+            cur_beat  = self._snap(cur_beat)
+            cur_pitch = max(self.PITCH_MIN, min(self.PITCH_MAX - 1, cur_pitch))
+            self._move_delta_beat  = cur_beat  - self._move_origin_beat
+            self._move_delta_pitch = cur_pitch - self._move_origin_pitch
+            # Clamp so no note goes below beat 0
+            if self._move_notes_state:
+                min_beat = min(b for b, _ in self._move_notes_state.values())
+                self._move_delta_beat = max(-min_beat, self._move_delta_beat)
+            self.update()
+
+        elif self._drag_mode == self._MODE_LASSO:
+            self._lasso_end = QPointF(ev.x(), ev.y())
+            self.update()
+
+        elif self._drag_mode == self._MODE_DRAW and self._draw_start:
+            self.update()   # live note-length preview not implemented; refresh anyway
+
+        # Update cursor shape based on what is under the mouse
+        gx = ev.x() - self.PIANO_WIDTH
+        gy = ev.y() - self.HEADER_HEIGHT
+        if self._drag_mode == self._MODE_NONE and ev.x() > self.PIANO_WIDTH:
+            _, zone = self._find_note_at_screen(gx, gy)
+            if zone == 'resize':
+                self.setCursor(Qt.SizeHorCursor)
+            elif zone == 'body':
+                self.setCursor(Qt.SizeAllCursor)
+            else:
+                self.setCursor(Qt.CrossCursor)
+
+    def mouseReleaseEvent(self, ev) -> None:
+        if ev.button() != Qt.LeftButton:
+            return
+
+        # ── Finalize ruler interaction ────────────────────────────────────
+        if self._ruler_pressed:
+            if self._loop_drag_origin is not None:
+                if self._loop_end - self._loop_start >= 0.25:
+                    self.loop_region_changed.emit(self._loop_start, self._loop_end)
+                self._loop_drag_origin = None
+            else:
+                self.seek_requested.emit(self._ruler_press_beat)
+            self._ruler_pressed = False
+            self.update()
+            return
+
+        # ── Finalize note draw ────────────────────────────────────────────
+        if self._drag_mode == self._MODE_DRAW and self._draw_start:
+            sb, pitch = self._draw_start
+            eb, _     = self._grid_coords(ev.x(), ev.y())
+            eb  = self._snap(eb)
+            grid = getattr(self, "_grid_beats", 0.25)
+            dur = max(grid, eb - sb) if eb > sb else grid
+            if self.PITCH_MIN <= pitch < self.PITCH_MAX:
+                self.note_added.emit(self._active_channel, sb, dur, pitch)
+            self._draw_start = None
+
+        # ── Finalize resize ───────────────────────────────────────────────
+        elif self._drag_mode == self._MODE_RESIZE:
+            new_dur = getattr(self, '_resize_preview_dur', None)
+            if new_dur is not None and new_dur > 0:
+                self.note_resized.emit(self._active_channel,
+                                       self._resize_note_id, new_dur)
+            self._resize_note_id = -1
+
+        # ── Finalize move ─────────────────────────────────────────────────
+        elif self._drag_mode == self._MODE_MOVE and self._move_notes_state:
+            db = getattr(self, '_move_delta_beat',  0.0)
+            dp = getattr(self, '_move_delta_pitch', 0)
+            for nid, (orig_beat, orig_pitch) in self._move_notes_state.items():
+                new_beat  = max(0.0, self._snap(orig_beat  + db))
+                new_pitch = max(self.PITCH_MIN, min(self.PITCH_MAX - 1,
+                                                    orig_pitch + dp))
+                self.note_moved.emit(self._active_channel, nid, new_beat, new_pitch)
+            self._move_notes_state.clear()
+            self._move_delta_beat  = 0.0
+            self._move_delta_pitch = 0
+
+        # ── Finalize lasso ────────────────────────────────────────────────
+        elif self._drag_mode == self._MODE_LASSO:
+            self._selected_ids = self._notes_in_lasso()
+            self._lasso_start = self._lasso_end = None
+
+        self._drag_mode = self._MODE_NONE
+        self.setCursor(Qt.ArrowCursor)
+        self.update()
+
+    def wheelEvent(self, ev) -> None:
+        dx, dy = ev.angleDelta().x(), ev.angleDelta().y()
+        if abs(dx) > abs(dy):
+            # Horizontal scroll → move beat timeline left/right
+            self._view_x = max(0.0, self._view_x - dx / 120)
+            self.scroll_x_changed.emit(self._view_x)
+        else:
+            # Vertical scroll → navigate pitches.
+            #
+            # Root cause of the previous "scroll up broken" bug:
+            #   Python's // is floor-division: -5 // 120 == -1 but 5 // 120 == 0.
+            #   That asymmetry caused downward scrolls (negative dy) to always
+            #   register at least one step while upward scrolls (positive dy)
+            #   did nothing unless dy >= 120.
+            #
+            # Fix: accumulate the raw delta and consume whole steps symmetrically.
+            #   int(x) truncates toward zero, so both directions behave the same.
+            self._vy_accum += dy
+            steps = int(self._vy_accum / 120)       # truncate, not floor
+            self._vy_accum -= steps * 120            # keep the remainder
+
+            if steps != 0:
+                gh = max(1, self.height() - self.HEADER_HEIGHT)
+                visible = gh // self.NOTE_HEIGHT
+                max_vy = max(0, self.PITCH_MAX - self.PITCH_MIN - visible)
+                # Positive dy / positive steps → scroll UP → lower view_y → higher notes
+                self._view_y = max(0, min(max_vy, self._view_y - steps))
+                self.view_y_changed.emit(self._view_y)
+        self.update()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Velocity Lane
+# ═══════════════════════════════════════════════════════════════════════════
+
+class VelocityLaneWidget(QWidget):
+    """
+    Velocity editor panel displayed below the piano roll grid.
+
+    Each MIDI note is represented by a vertical bar whose height is
+    proportional to its velocity (1–127).  Click or drag on a bar to
+    change the velocity live.  The lane shares the same horizontal beat
+    scale and view_x as PianoRollWidget and scrolls in sync with it.
+
+    Layout:
+        Left stub (PIANO_WIDTH px) — dark label area showing "VEL"
+        Right canvas              — gradient bars on a dark grid background
+    """
+
+    velocity_changed = Signal(int, int, int)   # channel, note_id, new_velocity
+
+    BEAT_WIDTH:  int = PianoRollWidget.BEAT_WIDTH
+    PIANO_WIDTH: int = PianoRollWidget.PIANO_WIDTH
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._notes:        List[MidiNote] = []
+        self._color:        QColor         = QColor(C["cyan"])
+        self._channel:      int            = 0
+        self._view_x:       float          = 0.0
+        self._selected_ids: set            = set()
+
+        self._drag_note_id:  int = -1
+        self._hover_note_id: int = -1
+
+        self.setMouseTracking(True)
+        self.setStyleSheet(f"background:{C['void']};")
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def set_notes_data(
+        self,
+        notes:   List[MidiNote],
+        color:   QColor,
+        channel: int,
+    ) -> None:
+        self._notes   = list(notes)
+        self._color   = color
+        self._channel = channel
+        self.update()
+
+    def set_view_x(self, vx: float) -> None:
+        self._view_x = max(0.0, vx)
+        self.update()
+
+    def set_selected_ids(self, ids: set) -> None:
+        self._selected_ids = set(ids)
+        self.update()
+
+    # ── Painting ──────────────────────────────────────────────────────────
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        inner_h = max(1, h - 1)   # 1 px top border reserved
+
+        # Left label stub
+        p.fillRect(0, 0, self.PIANO_WIDTH, h, QColor(C["abyss"]))
+        p.setPen(QColor(C["text_dim"]))
+        p.setFont(QFont("Arial", 8, QFont.Bold))
+        p.drawText(QRectF(0, 0, self.PIANO_WIDTH, h), Qt.AlignCenter, "VEL")
+        p.setPen(QPen(QColor(0, 229, 255, 30), 1))
+        p.drawLine(self.PIANO_WIDTH - 1, 0, self.PIANO_WIDTH - 1, h)
+
+        # Grid background
+        gw = w - self.PIANO_WIDTH
+        p.fillRect(self.PIANO_WIDTH, 0, gw, h, QColor(8, 10, 22))
+
+        # Top border glow
+        p.setPen(QPen(QColor(0, 229, 255, 55), 1))
+        p.drawLine(0, 0, w, 0)
+
+        # Reference lines at velocity 127, 100, 64
+        for ref_vel, alpha in ((127, 38), (100, 24), (64, 16)):
+            ry = int(inner_h - ref_vel / 127.0 * inner_h)
+            p.setPen(QPen(QColor(0, 229, 255, alpha), 1, Qt.DotLine))
+            p.drawLine(self.PIANO_WIDTH, ry, w, ry)
+        p.setFont(QFont("Arial", 7))
+        for ref_vel in (127, 100, 64):
+            ry = int(inner_h - ref_vel / 127.0 * inner_h)
+            p.setPen(QColor(C["text_dim"]))
+            p.drawText(
+                QRectF(self.PIANO_WIDTH + 3, ry - 9, 28, 9),
+                Qt.AlignLeft | Qt.AlignVCenter, str(ref_vel),
+            )
+
+        # ── Velocity bars ─────────────────────────────────────────────
+        layout = self._compute_bar_layout()
+
+        # Notes that share a start_beat with another note need pitch labels
+        beat_count: dict = {}
+        for note in self._notes:
+            key = round(note.start_beat, 4)
+            beat_count[key] = beat_count.get(key, 0) + 1
+        chord_ids = {
+            n.note_id for n in self._notes
+            if beat_count.get(round(n.start_beat, 4), 0) > 1
+        }
+
+        for note in self._notes:
+            if note.note_id not in layout:
+                continue
+            bar_left, bar_w = layout[note.note_id]
+
+            if bar_left + bar_w < self.PIANO_WIDTH or bar_left > w:
+                continue
+
+            bar_h   = max(2, int(note.velocity / 127.0 * inner_h))
+            bar_top = inner_h - bar_h
+
+            is_selected = note.note_id in self._selected_ids
+            is_dragged  = note.note_id == self._drag_note_id
+            is_hovered  = note.note_id == self._hover_note_id
+
+            grad = QLinearGradient(bar_left, bar_top, bar_left, inner_h)
+            if is_selected or is_dragged:
+                grad.setColorAt(0.0, self._color.lighter(220))
+                grad.setColorAt(0.5, self._color.lighter(150))
+                grad.setColorAt(1.0, self._color)
+            elif is_hovered:
+                grad.setColorAt(0.0, self._color.lighter(180))
+                grad.setColorAt(1.0, self._color.darker(110))
+            else:
+                grad.setColorAt(0.0, self._color.lighter(140))
+                grad.setColorAt(1.0, self._color.darker(140))
+            p.fillRect(QRectF(bar_left, bar_top, bar_w, bar_h), QBrush(grad))
+
+            # Bright cap on top of bar
+            cap_alpha = 160 if (is_selected or is_dragged) else 80
+            p.fillRect(QRectF(bar_left, bar_top, bar_w, 2),
+                       QColor(255, 255, 255, cap_alpha))
+
+            # Pitch label above bar for chord notes
+            if note.note_id in chord_ids:
+                p.setPen(QColor(C["text_dim"]))
+                p.setFont(QFont("Arial", 7))
+                pitch_offset = 24.0 if (is_hovered or is_dragged) else 11.0
+                pitch_y = max(1.0, bar_top - pitch_offset)
+                p.drawText(
+                    QRectF(bar_left, pitch_y, bar_w + 8, 10),
+                    Qt.AlignLeft, self._pitch_name(note.pitch),
+                )
+
+            # Velocity value label when hovered or dragged
+            if is_hovered or is_dragged:
+                p.setPen(QColor(C["text"]))
+                p.setFont(QFont("Arial", 8, QFont.Bold))
+                label_y = max(1.0, bar_top - 13.0)
+                p.drawText(
+                    QRectF(bar_left, label_y, 36.0, 12.0),
+                    Qt.AlignLeft, str(note.velocity),
+                )
+
+        p.end()
+
+    # ── Internal helpers ──────────────────────────────────────────────────
+
+    def _compute_bar_layout(self) -> dict:
+        """
+        Returns {note_id: (bar_left, bar_w)}.
+        Notes sharing a start_beat are spread side-by-side within the
+        space of the longest-duration note in that group.
+        """
+        GAP = 1.0
+        groups: dict = {}
+        for note in self._notes:
+            key = round(note.start_beat, 4)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(note)
+
+        layout = {}
+        for group in groups.values():
+            n = len(group)
+            ref = group[0]
+            base_left = ((ref.start_beat - self._view_x) * self.BEAT_WIDTH
+                         + self.PIANO_WIDTH)
+            if n == 1:
+                layout[ref.note_id] = (
+                    base_left,
+                    max(4.0, ref.duration * self.BEAT_WIDTH - 3),
+                )
+            else:
+                max_dur = max(note.duration for note in group)
+                natural_w = max(4.0, max_dur * self.BEAT_WIDTH - 3)
+                sub_w = max(4.0, (natural_w - (n - 1) * GAP) / n)
+                for i, note in enumerate(group):
+                    layout[note.note_id] = (base_left + i * (sub_w + GAP), sub_w)
+        return layout
+
+    @staticmethod
+    def _pitch_name(pitch: int) -> str:
+        names = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+        return f"{names[pitch % 12]}{pitch // 12 - 1}"
+
+    def _note_at_x(self, screen_x: int) -> Optional[MidiNote]:
+        """Return the note whose velocity bar contains screen_x."""
+        layout = self._compute_bar_layout()
+        for note in reversed(self._notes):
+            if note.note_id not in layout:
+                continue
+            bar_left, bar_w = layout[note.note_id]
+            if bar_left <= screen_x <= bar_left + bar_w:
+                return note
+        return None
+
+    def _vel_from_y(self, y: int) -> int:
+        inner_h = max(1, self.height() - 1)
+        return max(1, min(127, int((1.0 - y / inner_h) * 127)))
+
+    # ── Mouse events ──────────────────────────────────────────────────────
+
+    def mousePressEvent(self, ev) -> None:
+        if ev.button() != Qt.LeftButton or ev.x() < self.PIANO_WIDTH:
+            return
+        note = self._note_at_x(ev.x())
+        if note:
+            self._drag_note_id = note.note_id
+            new_vel = self._vel_from_y(ev.y())
+            note.velocity = new_vel
+            self.velocity_changed.emit(self._channel, note.note_id, new_vel)
+            self.update()
+
+    def mouseMoveEvent(self, ev) -> None:
+        if self._drag_note_id != -1:
+            note = next(
+                (n for n in self._notes if n.note_id == self._drag_note_id), None
+            )
+            if note:
+                new_vel = self._vel_from_y(ev.y())
+                note.velocity = new_vel
+                self.velocity_changed.emit(self._channel, note.note_id, new_vel)
+                self.update()
+        else:
+            note = self._note_at_x(ev.x())
+            new_hov = note.note_id if note else -1
+            if new_hov != self._hover_note_id:
+                self._hover_note_id = new_hov
+                self.update()
+            self.setCursor(Qt.SizeVerCursor if note else Qt.ArrowCursor)
+
+    def mouseReleaseEvent(self, ev) -> None:
+        if ev.button() == Qt.LeftButton and self._drag_note_id != -1:
+            self._drag_note_id = -1
+            self.update()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Audio Clip Lane
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AudioClipLane(QWidget):
+    """
+    Horizontal timeline lane for placing audio files (vocals, samples, etc.).
+
+    Layout:
+        Left stub (52 px) — labelled "AUDIO", aligns with the piano keyboard.
+        Ruler strip       — bar numbers, same beat scale as PianoRollWidget.
+        Clip area         — coloured blocks for each placed audio file.
+
+    Interaction:
+        Left-click on empty clip area  → open file dialog, place clip at that beat.
+        Right-click on an existing clip → remove it.
+        Scroll wheel                   → sync horizontal scroll with piano roll.
+    """
+
+    clip_added     = Signal(str, float, float)   # path, start_beat, duration_secs
+    clip_removed   = Signal(int)                  # clip_id
+    scroll_changed = Signal(float)               # view_x
+
+    BEAT_WIDTH:  int = 80   # must match PianoRollWidget.BEAT_WIDTH
+    PIANO_WIDTH: int = 52   # must match PianoRollWidget.PIANO_WIDTH
+    RULER_H:     int = 22
+    CLIP_H:      int = 56   # height of the clip drawing area
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._clips: List[AudioClip] = []
+        self._view_x: float  = 0.0
+        self._bpm:    float  = 120.0
+        self._total_beats: float = 64.0
+        self._loop_enabled: bool  = False
+        self._loop_start:   float = 0.0
+        self._loop_end:     float = 8.0
+
+        self.setFixedHeight(self.RULER_H + self.CLIP_H + 4)
+        self.setMouseTracking(True)
+        self.setStyleSheet(f"background:{C['abyss']};")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def set_clips(self, clips: List[AudioClip]) -> None:
+        self._clips = list(clips)
+        self.update()
+
+    def set_view_x(self, x: float) -> None:
+        self._view_x = max(0.0, x)
+        self.update()
+
+    def set_bpm(self, bpm: float) -> None:
+        self._bpm = max(20.0, bpm)
+        self.update()
+
+    def set_loop_region(self, enabled: bool, start: float, end: float) -> None:
+        self._loop_enabled = enabled
+        self._loop_start   = start
+        self._loop_end     = end
+        self.update()
+
+    # ------------------------------------------------------------------
+    # Painting
+    # ------------------------------------------------------------------
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        gw = w - self.PIANO_WIDTH
+
+        p.fillRect(0, 0, w, h, QColor(C["abyss"]))
+
+        # Piano-width stub
+        p.fillRect(0, 0, self.PIANO_WIDTH - 1, h, QColor(C["deep"]))
+        p.setPen(QPen(QColor(0, 229, 255, 40), 1))
+        p.drawLine(self.PIANO_WIDTH - 1, 0, self.PIANO_WIDTH - 1, h)
+        p.setFont(QFont("Arial", 8, QFont.Bold))
+        p.setPen(QColor(C["text_dim"]))
+        p.drawText(0, 0, self.PIANO_WIDTH - 2, h, Qt.AlignCenter, "AUDIO\nCLIPS")
+
+        p.save()
+        p.translate(self.PIANO_WIDTH, 0)
+
+        # ── Ruler ───────────────────────────────────────────────────────
+        p.fillRect(0, 0, gw, self.RULER_H, QColor(C["deep"]))
+        p.setPen(QPen(QColor(0, 229, 255, 25), 1))
+        p.drawLine(0, self.RULER_H - 1, gw, self.RULER_H - 1)
+
+        p.setFont(QFont("Arial", 8))
+        beat = 0
+        while beat <= self._total_beats:
+            x = int((beat - self._view_x) * self.BEAT_WIDTH)
+            if 0 <= x <= gw:
+                if beat % 4 == 0:
+                    p.setPen(QColor(C["text_dim"]))
+                    p.drawText(x + 2, self.RULER_H - 3, f"B{int(beat // 4) + 1}")
+                p.setPen(QPen(QColor(0, 229, 255, 20), 1))
+                p.drawLine(x, 0, x, self.RULER_H)
+            beat += 4
+
+        # ── Loop region highlight ────────────────────────────────────────
+        if self._loop_enabled:
+            xs = int((self._loop_start - self._view_x) * self.BEAT_WIDTH)
+            xe = int((self._loop_end   - self._view_x) * self.BEAT_WIDTH)
+            if xs < gw and xe > 0:
+                fill_x = max(0, xs)
+                fill_w = min(gw, xe) - fill_x
+                p.fillRect(fill_x, 0, fill_w, h, QColor(153, 69, 255, 22))
+                p.setPen(QPen(QColor(C["purple"]), 1))
+                if 0 <= xs <= gw:
+                    p.drawLine(xs, 0, xs, h)
+                if 0 <= xe <= gw:
+                    p.drawLine(xe, 0, xe, h)
+
+        # ── Clip blocks ─────────────────────────────────────────────────
+        clip_y     = self.RULER_H + 2
+        clip_h     = self.CLIP_H - 4
+        secs_per_beat = 60.0 / self._bpm
+
+        for clip in self._clips:
+            x = (clip.start_beat - self._view_x) * self.BEAT_WIDTH
+            if clip.duration_seconds > 0:
+                dur_beats = clip.duration_seconds / secs_per_beat
+            else:
+                dur_beats = 4.0  # default visual width: one bar
+            cw = dur_beats * self.BEAT_WIDTH
+
+            if x + cw < 0 or x > gw:
+                continue
+
+            color = QColor(clip.color)
+            rect  = QRectF(x, clip_y, max(8.0, cw - 2), clip_h)
+
+            grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+            grad.setColorAt(0, QColor(color.red(), color.green(), color.blue(), 180))
+            grad.setColorAt(1, QColor(color.red(), color.green(), color.blue(), 80))
+            p.fillRect(rect, QBrush(grad))
+
+            # Waveform-like decoration (horizontal stripes)
+            p.setPen(QPen(QColor(255, 255, 255, 30), 1))
+            for stripe_y in range(int(clip_y) + 4, int(clip_y + clip_h) - 4, 6):
+                p.drawLine(int(x) + 2, stripe_y, int(x + cw) - 4, stripe_y)
+
+            p.setPen(QPen(color.lighter(160), 1))
+            p.drawRoundedRect(rect, 3, 3)
+
+            # Filename
+            p.setPen(QColor(255, 255, 255, 210))
+            p.setFont(QFont("Arial", 8, QFont.Bold))
+            fname = clip.name if clip.name else clip.path.split("/")[-1]
+            if len(fname) > 18:
+                fname = fname[:15] + "…"
+            p.drawText(
+                QRectF(x + 4, clip_y + 2, max(10.0, cw - 8), clip_h - 4),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                fname,
+            )
+
+        # ── Empty-state hint ────────────────────────────────────────────
+        if not self._clips:
+            p.setPen(QColor(C["text_dim"]))
+            p.setFont(QFont("Arial", 9))
+            p.drawText(
+                QRectF(0, self.RULER_H, gw, self.CLIP_H),
+                Qt.AlignCenter,
+                "Left-click to place an audio file  ·  Right-click to remove",
+            )
+
+        p.restore()
+
+    # ------------------------------------------------------------------
+    # Mouse interaction
+    # ------------------------------------------------------------------
+
+    def mousePressEvent(self, ev) -> None:
+        if ev.x() < self.PIANO_WIDTH:
+            return
+
+        beat = (ev.x() - self.PIANO_WIDTH) / self.BEAT_WIDTH + self._view_x
+        beat = max(0.0, round(beat * 4) / 4)
+
+        if ev.button() == Qt.RightButton:
+            secs_per_beat = 60.0 / self._bpm
+            for clip in self._clips:
+                x = (clip.start_beat - self._view_x) * self.BEAT_WIDTH
+                dur_beats = (clip.duration_seconds / secs_per_beat
+                             if clip.duration_seconds > 0 else 4.0)
+                cw  = dur_beats * self.BEAT_WIDTH
+                abs_x = x + self.PIANO_WIDTH
+                if abs_x <= ev.x() <= abs_x + cw and ev.y() >= self.RULER_H:
+                    self.clip_removed.emit(clip.clip_id)
+                    return
+
+        elif ev.button() == Qt.LeftButton and ev.y() >= self.RULER_H:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Import Audio File",
+                os.path.expanduser("~"),
+                "Audio Files (*.wav *.mp3 *.ogg *.flac *.aiff *.m4a);;All Files (*)",
+            )
+            if path:
+                dur = self._get_duration(path)
+                self.clip_added.emit(path, beat, dur)
+
+    def wheelEvent(self, ev) -> None:
+        dx = ev.angleDelta().x()
+        dy = ev.angleDelta().y()
+        delta = dx if abs(dx) > abs(dy) else -dy
+        self._view_x = max(0.0, self._view_x + delta / 120)
+        self.scroll_changed.emit(self._view_x)
+        self.update()
+
+    # ------------------------------------------------------------------
+    # Private
+    # ------------------------------------------------------------------
+
+    def _get_duration(self, path: str) -> float:
+        """Best-effort audio duration in seconds."""
+        try:
+            import pygame
+            sound = pygame.mixer.Sound(path)
+            return sound.get_length()
+        except Exception:
+            pass
+        try:
+            import wave
+            with wave.open(path, "r") as wf:
+                return wf.getnframes() / wf.getframerate()
+        except Exception:
+            return 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Mixer Track Strip
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _ClickableLabel(QLabel):
+    double_clicked = Signal()
+    def mouseDoubleClickEvent(self, ev) -> None:
+        self.double_clicked.emit()
+
+
+class MixerStrip(QFrame):
+    """
+    Crystal-themed vertical channel strip.
+    Glowing colour-bar at the top identifies the track at a glance.
+    """
+
+    gain_changed   = Signal(int, float)
+    pan_changed    = Signal(int, float)
+    mute_toggled   = Signal(int, bool)
+    solo_toggled   = Signal(int, bool)
+    track_selected = Signal(int)
+    remove_clicked = Signal(int)
+    name_changed   = Signal(int, str)
+
+    def __init__(self, channel: int, name: str, color: str,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.channel   = channel
+        self._building = True
+        self._color    = color
+
+        self.setFixedWidth(96)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setStyleSheet(f"""
+            MixerStrip {{
+                background: {C["abyss"]};
+                border: 1px solid rgba(0,229,255,0.1);
+                border-radius: 8px;
+                margin: 2px;
+            }}
+        """)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(5, 5, 5, 6)
+        lay.setSpacing(3)
+
+        # Colour glow bar + remove × button
+        top = QHBoxLayout()
+        bar = QFrame()
+        bar.setFixedHeight(5)
+        bar.setStyleSheet(
+            f"background: {color}; border-radius: 2px;"
+            f" border: none;"
+        )
+        top.addWidget(bar, stretch=1)
+        rm = QPushButton("×")
+        rm.setFixedSize(16, 16)
+        rm.setStyleSheet(
+            f"QPushButton {{ background: rgba(255,45,158,0.18); border: none;"
+            f" border-radius: 8px; color: {C['pink']}; font-size: 11px; }}"
+            f"QPushButton:hover {{ background: {C['pink']}; color: white; }}"
+        )
+        rm.clicked.connect(lambda: self.remove_clicked.emit(channel))
+        top.addWidget(rm)
+        lay.addLayout(top)
+
+        # Track name (double-click to rename)
+        self._name_label = _ClickableLabel(name[:10])
+        self._name_label.setAlignment(Qt.AlignCenter)
+        self._name_label.setFont(QFont("Arial", 8, QFont.Bold))
+        self._name_label.setStyleSheet(f"color:{color}; background:transparent;")
+        self._name_label.setWordWrap(True)
+        self._name_label.setToolTip("Double-click to rename")
+        self._name_label.double_clicked.connect(self._on_rename)
+        lay.addWidget(self._name_label)
+
+        # Instrument subtitle (shows currently loaded preset, separate from track name)
+        self._instrument_label = QLabel("")
+        self._instrument_label.setAlignment(Qt.AlignCenter)
+        self._instrument_label.setStyleSheet(
+            f"color:{C['text_dim']}; font-size:8px; background:transparent;")
+        self._instrument_label.setWordWrap(True)
+        lay.addWidget(self._instrument_label)
+
+        # Channel number
+        cl = QLabel(f"CH {channel+1:02d}")
+        cl.setAlignment(Qt.AlignCenter)
+        cl.setStyleSheet(f"color:{C['text_dim']}; font-size:9px; background:transparent;")
+        lay.addWidget(cl)
+
+        # Volume fader
+        vol_row = QVBoxLayout()
+        vol_row.setSpacing(2)
+        lbl_vol = QLabel("VOL")
+        lbl_vol.setAlignment(Qt.AlignCenter)
+        lbl_vol.setStyleSheet(f"color:{C['text_dim']}; font-size:8px; background:transparent;")
+        vol_row.addWidget(lbl_vol)
+        self.vol = QSlider(Qt.Vertical)
+        self.vol.setRange(0, 100)
+        self.vol.setValue(80)
+        self.vol.setFixedHeight(90)
+        self.vol.valueChanged.connect(self._on_vol)
+        vol_row.addWidget(self.vol, alignment=Qt.AlignCenter)
+        lay.addLayout(vol_row)
+
+        # Pan
+        lbl_pan = QLabel("PAN")
+        lbl_pan.setAlignment(Qt.AlignCenter)
+        lbl_pan.setStyleSheet(f"color:{C['text_dim']}; font-size:8px; background:transparent;")
+        lay.addWidget(lbl_pan)
+        self.pan = QSlider(Qt.Horizontal)
+        self.pan.setRange(-50, 50)
+        self.pan.setValue(0)
+        self.pan.valueChanged.connect(self._on_pan)
+        lay.addWidget(self.pan)
+
+        # Mute / Solo
+        ms = QHBoxLayout()
+        ms.setSpacing(3)
+        self.mute_btn = QPushButton("M")
+        self.mute_btn.setCheckable(True)
+        self.mute_btn.setFixedSize(30, 22)
+        self.mute_btn.setStyleSheet(
+            f"QPushButton {{ background:{C['deep']}; border:1px solid rgba(255,107,43,0.3);"
+            f" border-radius:3px; color:{C['text_dim']}; font-size:10px; }}"
+            f"QPushButton:checked {{ background:rgba(255,107,43,0.4);"
+            f" border-color:{C['orange']}; color:{C['orange']}; }}"
+        )
+        self.mute_btn.toggled.connect(lambda v: self.mute_toggled.emit(channel, v))
+        ms.addWidget(self.mute_btn)
+
+        self.solo_btn = QPushButton("S")
+        self.solo_btn.setCheckable(True)
+        self.solo_btn.setFixedSize(30, 22)
+        self.solo_btn.setStyleSheet(
+            f"QPushButton {{ background:{C['deep']}; border:1px solid rgba(255,215,0,0.3);"
+            f" border-radius:3px; color:{C['text_dim']}; font-size:10px; }}"
+            f"QPushButton:checked {{ background:rgba(255,215,0,0.3);"
+            f" border-color:{C['gold']}; color:{C['gold']}; }}"
+        )
+        self.solo_btn.toggled.connect(lambda v: self.solo_toggled.emit(channel, v))
+        ms.addWidget(self.solo_btn)
+        lay.addLayout(ms)
+
+        # Select button
+        self.sel_btn = QPushButton("●")
+        self.sel_btn.setCheckable(True)
+        self.sel_btn.setFixedHeight(22)
+        self.sel_btn.setToolTip("Select — route keyboard/gamepad to this track")
+        self.sel_btn.setStyleSheet(
+            f"QPushButton {{ background:{C['deep']}; border:1px solid rgba(0,229,255,0.2);"
+            f" border-radius:3px; color:{C['text_dim']}; font-size:11px; }}"
+            f"QPushButton:checked {{ background:rgba(0,229,255,0.2);"
+            f" border-color:{C['cyan']}; color:{C['cyan']}; }}"
+        )
+        self.sel_btn.clicked.connect(lambda: self.track_selected.emit(channel))
+        lay.addWidget(self.sel_btn)
+
+        lay.addStretch()
+        self._building = False
+
+    # ------------------------------------------------------------------
+
+    def _on_vol(self, v: int) -> None:
+        if not self._building:
+            self.gain_changed.emit(self.channel, v / 100.0)
+
+    def _on_pan(self, v: int) -> None:
+        if not self._building:
+            self.pan_changed.emit(self.channel, v / 50.0)
+
+    def set_selected(self, selected: bool) -> None:
+        self.sel_btn.setChecked(selected)
+        self.setStyleSheet(f"""
+            MixerStrip {{
+                background: {C['abyss']};
+                border: 1px solid {'rgba(0,229,255,0.55)' if selected else 'rgba(0,229,255,0.1)'};
+                border-radius: 8px;
+                margin: 2px;
+            }}
+        """)
+
+    def set_name(self, name: str) -> None:
+        self._name_label.setText(name[:10])
+
+    def set_instrument_name(self, name: str) -> None:
+        """Update the instrument subtitle label (not the track name)."""
+        self._instrument_label.setText(name[:12])
+        self._instrument_label.setVisible(bool(name))
+
+    def _on_rename(self) -> None:
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Track", "Track name:",
+            text=self._name_label.text(),
+        )
+        if ok and new_name.strip():
+            self.set_name(new_name.strip())
+            self.name_changed.emit(self.channel, new_name.strip())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Transport Bar
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TransportBar(QWidget):
+    play_clicked   = Signal()
+    stop_clicked   = Signal()
+    record_clicked = Signal(bool)
+    bpm_changed    = Signal(float)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setStyleSheet(f"background:{C['abyss']};")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 4, 10, 4)
+        lay.setSpacing(8)
+
+        def _tb(text: str, tip: str = "", checkable: bool = False,
+                color: str = "") -> QPushButton:
+            b = QPushButton(text)
+            b.setFixedHeight(34)
+            b.setCheckable(checkable)
+            b.setToolTip(tip)
+            if color:
+                b.setStyleSheet(
+                    f"QPushButton {{ background:{C['deep']}; color:{color};"
+                    f" border:1px solid rgba(0,229,255,0.3); border-radius:5px; }}"
+                    f"QPushButton:hover {{ border-color:{color}; }}"
+                    f"QPushButton:checked {{ background:rgba(255,45,158,0.3);"
+                    f" border-color:{C['pink']}; color:{C['pink']}; }}"
+                )
+            return b
+
+        self.play_btn   = _tb("▶  PLAY",   "Play from start")
+        self.stop_btn   = _tb("■  STOP",   "Stop + rewind")
+        self.record_btn = _tb("⏺  REC",    "Record", True, C["orange"])
+
+        self.play_btn  .clicked.connect(self.play_clicked)
+        self.stop_btn  .clicked.connect(self.stop_clicked)
+        self.record_btn.toggled.connect(self.record_clicked)
+
+        lay.addWidget(self.play_btn)
+        lay.addWidget(self.stop_btn)
+        lay.addWidget(self.record_btn)
+
+        lay.addSpacing(20)
+
+        # BPM
+        lay.addWidget(_label("BPM", C["text_dim"], 10))
+        self.bpm_spin = QDoubleSpinBox()
+        self.bpm_spin.setRange(20, 300)
+        self.bpm_spin.setValue(120)
+        self.bpm_spin.setSingleStep(1)
+        self.bpm_spin.setFixedWidth(72)
+        self.bpm_spin.valueChanged.connect(self.bpm_changed)
+        lay.addWidget(self.bpm_spin)
+
+        lay.addStretch()
+
+        # Composition mode toggle
+        self.comp_mode_btn = QPushButton("◈  COMP VIEW")
+        self.comp_mode_btn.setCheckable(True)
+        self.comp_mode_btn.setFixedHeight(34)
+        self.comp_mode_btn.setToolTip("Show all tracks simultaneously in piano roll")
+        lay.addWidget(self.comp_mode_btn)
+
+        # Loop toggle
+        self.loop_btn = QPushButton("⟳  LOOP")
+        self.loop_btn.setCheckable(True)
+        self.loop_btn.setFixedHeight(34)
+        self.loop_btn.setToolTip(
+            "Loop playback between markers — drag the ruler in the piano roll to set the region"
+        )
+        self.loop_btn.setStyleSheet(
+            f"QPushButton {{ background:{C['deep']}; color:{C['purple']};"
+            f" border:1px solid rgba(153,69,255,0.4); border-radius:5px; }}"
+            f"QPushButton:hover {{ border-color:{C['purple']}; }}"
+            f"QPushButton:checked {{ background:rgba(153,69,255,0.3);"
+            f" border-color:{C['purple']}; color:{C['purple']}; }}"
+        )
+        lay.addWidget(self.loop_btn)
+
+        lay.addSpacing(12)
+
+        # Scale / Root / Octave
+        lay.addWidget(_label("SCALE", C["text_dim"], 10))
+        self.scale_combo = QComboBox()
+        self.scale_combo.addItems(sorted(SCALES.keys()))
+        self.scale_combo.setCurrentText("major")
+        self.scale_combo.setFixedWidth(120)
+        lay.addWidget(self.scale_combo)
+
+        lay.addWidget(_label("ROOT", C["text_dim"], 10))
+        self.root_combo = QComboBox()
+        self.root_combo.addItems(
+            [f"{n}4" for n in
+             ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]]
+        )
+        self.root_combo.setCurrentText("C4")
+        self.root_combo.setFixedWidth(58)
+        lay.addWidget(self.root_combo)
+
+        lay.addWidget(_label("OCT", C["text_dim"], 10))
+        self.octave_spin = QSpinBox()
+        self.octave_spin.setRange(-3, 3)
+        self.octave_spin.setValue(0)
+        self.octave_spin.setFixedWidth(48)
+        lay.addWidget(self.octave_spin)
+
+        lay.addSpacing(12)
+
+        self.panic_btn = QPushButton("⚡ PANIC")
+        self.panic_btn.setFixedHeight(34)
+        self.panic_btn.setStyleSheet(
+            f"QPushButton {{ background:#1A0000; color:{C['orange']};"
+            f" border:1px solid rgba(255,107,43,0.5); border-radius:5px; }}"
+            f"QPushButton:hover {{ background:rgba(255,107,43,0.3); }}"
+        )
+        self.panic_btn.setToolTip("All notes off — emergency silence")
+        lay.addWidget(self.panic_btn)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Change Instrument Dialog
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ChangeInstrumentDialog(QDialog):
+    """Browse GM presets and optionally a custom SF2 to reassign a track's sound.
+    The track's notes are untouched — only the instrument binding changes."""
+
+    def __init__(self, engine: AudioEngine, track_name: str,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._engine = engine
+        self._result_info: Optional[tuple] = None  # (sf2_path, bank, preset)
+
+        self.setWindowTitle(f"Change Instrument  —  {track_name}")
+        self.setMinimumSize(600, 440)
+        self.setStyleSheet(STYLESHEET)
+
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(14, 14, 14, 14)
+
+        hdr = _label("CHANGE INSTRUMENT", C["cyan"], 13, True)
+        hdr.setStyleSheet(
+            f"color:{C['cyan']}; font-size:13px; font-weight:bold;"
+            f" letter-spacing:3px; background:transparent;"
+        )
+        root.addWidget(hdr)
+
+        # SF2 picker
+        sf2_row = QHBoxLayout()
+        sf2_row.addWidget(_label("SOUNDFONT", C["text_dim"], 10))
+        self._sf2_combo = QComboBox()
+        self._sf2_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        sf2_files = AudioEngine.get_available_sf2_files()
+        for p in sf2_files:
+            self._sf2_combo.addItem(os.path.basename(p), userData=p)
+        if not sf2_files:
+            self._sf2_combo.addItem("— no SF2 found —", userData="")
+        sf2_row.addWidget(self._sf2_combo)
+        browse = QPushButton("Browse…")
+        browse.setFixedWidth(90)
+        browse.clicked.connect(self._browse_sf2)
+        sf2_row.addWidget(browse)
+        root.addLayout(sf2_row)
+
+        # Category / Preset browser
+        sp = QSplitter(Qt.Horizontal)
+        self._cat_list = QListWidget()
+        self._cat_list.setFixedWidth(155)
+        for cat in GM_INSTRUMENTS:
+            self._cat_list.addItem(QListWidgetItem(cat))
+        self._cat_list.currentRowChanged.connect(self._on_cat)
+        sp.addWidget(self._cat_list)
+
+        self._pre_list = QListWidget()
+        sp.addWidget(self._pre_list)
+        sp.setStretchFactor(0, 0)
+        sp.setStretchFactor(1, 1)
+        root.addWidget(sp, stretch=1)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btn_row.addWidget(cancel)
+        ok = QPushButton("✦  Apply Instrument")
+        ok.setDefault(True)
+        ok.setStyleSheet(
+            f"QPushButton {{ background:rgba(0,229,255,0.15);"
+            f" border:1px solid {C['cyan']}; color:{C['cyan']};"
+            f" border-radius:5px; padding:6px 18px; }}"
+            f"QPushButton:hover {{ background:rgba(0,229,255,0.3); }}"
+        )
+        ok.clicked.connect(self._on_ok)
+        btn_row.addWidget(ok)
+        root.addLayout(btn_row)
+
+        self._cat_list.setCurrentRow(0)
+
+    def _on_cat(self, row: int) -> None:
+        if row < 0:
+            return
+        cat = self._cat_list.item(row).text()
+        self._pre_list.clear()
+        for preset, bank, name in GM_INSTRUMENTS.get(cat, []):
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, (preset, bank, name))
+            self._pre_list.addItem(item)
+        self._pre_list.setCurrentRow(0)
+
+    def _browse_sf2(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select SoundFont", os.path.expanduser("~"),
+            "SoundFont Files (*.sf2);;All Files (*)"
+        )
+        if path:
+            self._sf2_combo.insertItem(0, os.path.basename(path), userData=path)
+            self._sf2_combo.setCurrentIndex(0)
+
+    def _on_ok(self) -> None:
+        sf2: str = self._sf2_combo.currentData() or ""
+        if not sf2 or not os.path.isfile(sf2):
+            QMessageBox.warning(self, "No SoundFont",
+                "Please select a valid .sf2 file or click Browse…")
+            return
+        pre_item = self._pre_list.currentItem()
+        if pre_item is None:
+            QMessageBox.warning(self, "No Instrument",
+                "Please select an instrument.")
+            return
+        preset, bank, preset_name = pre_item.data(Qt.UserRole)
+        self._result_info = (sf2, bank, preset, preset_name)
+        self.accept()
+
+    def result_plugin_info(self) -> Optional[tuple]:
+        return self._result_info
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VST Browser Dialog
+# ═══════════════════════════════════════════════════════════════════════════
+
+class VstBrowserDialog(QDialog):
+    """
+    File browser for selecting a VST3 or Audio Unit plugin.
+
+    On open the dialog automatically scans the standard system plugin
+    directories and lists every found plugin.  The user may also locate a
+    plugin manually via "Browse…".
+
+    Returns the selected plugin path and a user-supplied track name via
+    result_path() / result_name() after Accepted.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("✦  Load VST3 / AU Plugin")
+        self.setMinimumSize(660, 500)
+        self.setStyleSheet(STYLESHEET)
+
+        self._result_path: str = ""
+        self._result_name: str = ""
+
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+
+        root.addWidget(_label("SELECT A VST3 / AU PLUGIN", C["purple"], 12, True))
+
+        # Scan button + status hint
+        scan_row = QHBoxLayout()
+        scan_btn = QPushButton("↺  Scan System Paths")
+        scan_btn.setFixedWidth(180)
+        scan_btn.setStyleSheet(
+            f"QPushButton {{ background:{C['deep']}; color:{C['purple']};"
+            f" border:1px solid rgba(153,69,255,0.4); border-radius:4px;"
+            f" padding:4px 12px; }}"
+            f"QPushButton:hover {{ background:rgba(153,69,255,0.2); }}"
+        )
+        scan_btn.clicked.connect(self._scan)
+        scan_row.addWidget(scan_btn)
+        self._scan_hint = QLabel("")
+        self._scan_hint.setStyleSheet(f"color:{C['text_dim']}; font-size:10px;")
+        scan_row.addWidget(self._scan_hint)
+        scan_row.addStretch()
+        root.addLayout(scan_row)
+
+        # Plugin list
+        self._plugin_list = QListWidget()
+        self._plugin_list.setStyleSheet(
+            f"QListWidget {{ background:{C['deep']}; border:1px solid rgba(153,69,255,0.3);"
+            f" border-radius:4px; }}"
+            f"QListWidget::item {{ color:{C['text']}; padding:4px 8px; }}"
+            f"QListWidget::item:selected {{ background:rgba(153,69,255,0.25);"
+            f" color:{C['purple']}; }}"
+        )
+        self._plugin_list.currentRowChanged.connect(self._on_row_changed)
+        root.addWidget(self._plugin_list, stretch=1)
+
+        # Manual browse row
+        browse_row = QHBoxLayout()
+        browse_row.addWidget(
+            _label("Or choose a file manually:", C["text_dim"], 10))
+        browse_btn = QPushButton("Browse…")
+        browse_btn.setFixedWidth(100)
+        browse_btn.clicked.connect(self._browse)
+        browse_row.addWidget(browse_btn)
+        browse_row.addStretch()
+        root.addLayout(browse_row)
+
+        # Track name input
+        nm_row = QHBoxLayout()
+        nm_row.addWidget(_label("TRACK NAME", C["text_dim"], 10))
+        self._name_edit = QLineEdit()
+        self._name_edit.setPlaceholderText("e.g.  My Synth Lead")
+        nm_row.addWidget(self._name_edit)
+        root.addLayout(nm_row)
+
+        # Dialog buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btn_row.addWidget(cancel)
+        self._ok_btn = QPushButton("✦  Load Plugin")
+        self._ok_btn.setDefault(True)
+        self._ok_btn.setEnabled(False)
+        self._ok_btn.setStyleSheet(
+            f"QPushButton {{ background:rgba(153,69,255,0.18);"
+            f" border:1px solid {C['purple']}; color:{C['purple']};"
+            f" border-radius:5px; padding:6px 18px; }}"
+            f"QPushButton:hover {{ background:rgba(153,69,255,0.38); }}"
+            f"QPushButton:disabled {{ color:rgba(153,69,255,0.3);"
+            f" border-color:rgba(153,69,255,0.15); }}"
+        )
+        self._ok_btn.clicked.connect(self._on_ok)
+        btn_row.addWidget(self._ok_btn)
+        root.addLayout(btn_row)
+
+        # Populate list immediately
+        self._scan()
+
+    # ------------------------------------------------------------------
+
+    def _scan(self) -> None:
+        """Scan OS plugin paths and refresh the list widget."""
+        self._plugin_list.clear()
+        plugins = scan_vst_paths()
+        if plugins:
+            self._scan_hint.setText(f"{len(plugins)} plugin(s) found")
+            for p in plugins:
+                item = QListWidgetItem(os.path.basename(p))
+                item.setData(Qt.UserRole, p)
+                self._plugin_list.addItem(item)
+        else:
+            self._scan_hint.setText("No plugins found in system paths — use Browse…")
+            self._plugin_list.addItem(
+                QListWidgetItem("— No plugins found in standard directories —"))
+
+    def _on_row_changed(self, row: int) -> None:
+        item = self._plugin_list.item(row)
+        if not item:
+            return
+        path = item.data(Qt.UserRole)
+        if not path:
+            return
+        self._result_path = path
+        if not self._name_edit.text():
+            self._name_edit.setText(
+                os.path.splitext(os.path.basename(path))[0])
+        self._ok_btn.setEnabled(True)
+
+    def _browse(self) -> None:
+        start = "/Library/Audio/Plug-Ins/VST3" if os.path.isdir(
+            "/Library/Audio/Plug-Ins/VST3") else os.path.expanduser("~")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select VST3 / AU Plugin", start,
+            "Plugin Files (*.vst3 *.component);;All Files (*)",
+        )
+        if path:
+            self._result_path = path
+            if not self._name_edit.text():
+                self._name_edit.setText(
+                    os.path.splitext(os.path.basename(path))[0])
+            self._ok_btn.setEnabled(True)
+
+    def _on_ok(self) -> None:
+        if not self._result_path:
+            QMessageBox.warning(self, "No Plugin Selected",
+                "Please pick a plugin from the list or use Browse…")
+            return
+        self._result_name = (
+            self._name_edit.text().strip()
+            or os.path.splitext(os.path.basename(self._result_path))[0]
+        )
+        self.accept()
+
+    def result_path(self) -> str: return self._result_path
+    def result_name(self) -> str: return self._result_name
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VST Parameter Panel
+# ═══════════════════════════════════════════════════════════════════════════
+
+class VstParameterPanel(QDialog):
+    """
+    Live parameter editor for a loaded VST plugin.
+
+    Displays every plugin parameter as a labelled horizontal slider.
+    Slider changes are forwarded immediately to VstManager.set_parameter
+    so the plugin hears the new value without requiring an OK button.
+
+    The "Open Native Editor" button opens the plugin's own GUI in a
+    background thread so the Qt event loop stays responsive.
+    """
+
+    def __init__(
+        self,
+        vst_manager: VstManager,
+        channel:     int,
+        controller,                    # ControllerManager — for key monitor routing
+        parent:      Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._vst_manager = vst_manager
+        self._channel     = channel
+        self._controller  = controller
+
+        track = vst_manager.get_track(channel)
+        name  = track.name if track else f"Channel {channel + 1}"
+
+        self.setWindowTitle(f"VST Parameters — {name}")
+        self.setMinimumSize(480, 520)
+        self.setStyleSheet(STYLESHEET)
+
+        root = QVBoxLayout(self)
+        root.setSpacing(8)
+
+        root.addWidget(_label(f"PARAMETERS  —  {name}", C["purple"], 12, True))
+
+        params = vst_manager.get_parameters(channel)
+
+        if not params:
+            msg = ("No parameters available.\n\n"
+                   "Either the plugin has no exposed parameters, or "
+                   "pedalboard could not read them.")
+            root.addWidget(_label(msg, C["text_dim"], 11))
+        else:
+            # Scrollable grid of parameter sliders
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setStyleSheet(
+                f"QScrollArea {{ background:{C['deep']}; border:none; }}")
+            inner = QWidget()
+            inner.setStyleSheet(f"background:{C['deep']};")
+            grid = QGridLayout(inner)
+            grid.setSpacing(6)
+            grid.setContentsMargins(8, 8, 8, 8)
+
+            for row, (pname, value) in enumerate(params.items()):
+                lbl = QLabel(pname[:28])
+                lbl.setStyleSheet(
+                    f"color:{C['text']}; font-size:11px;")
+
+                slider = QSlider(Qt.Horizontal)
+                slider.setRange(0, 1000)
+                slider.setValue(int(value * 1000))
+
+                val_lbl = QLabel(f"{value:.3f}")
+                val_lbl.setFixedWidth(46)
+                val_lbl.setStyleSheet(
+                    f"color:{C['cyan']}; font-size:10px;")
+
+                # Capture the parameter name and value label in a closure
+                def _handler(v: int, p: str = pname, vl: QLabel = val_lbl) -> None:
+                    nv = v / 1000.0
+                    self._vst_manager.set_parameter(self._channel, p, nv)
+                    vl.setText(f"{nv:.3f}")
+
+                slider.valueChanged.connect(_handler)
+
+                grid.addWidget(lbl,     row, 0)
+                grid.addWidget(slider,  row, 1)
+                grid.addWidget(val_lbl, row, 2)
+
+            scroll.setWidget(inner)
+            root.addWidget(scroll, stretch=1)
+
+        # Action buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        native_btn = QPushButton("⬡  Open Native Editor")
+        native_btn.setStyleSheet(
+            f"QPushButton {{ background:rgba(153,69,255,0.15);"
+            f" color:{C['purple']}; border:1px solid rgba(153,69,255,0.4);"
+            f" border-radius:4px; padding:6px 14px; }}"
+            f"QPushButton:hover {{ background:rgba(153,69,255,0.35); }}"
+        )
+        native_btn.clicked.connect(self._open_native)
+        btn_row.addWidget(native_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+
+    def _open_native(self) -> None:
+        """
+        Open the plugin's own GUI editor.
+
+        Strategy (macOS / JUCE / CoreAudio):
+          - Stop the CoreAudio stream BEFORE show_editor() so JUCE can
+            initialise its editor without a concurrent audio callback.
+          - Schedule a stream restart 200 ms in via QTimer (which fires
+            inside show_editor()'s CFRunLoop) so QWERTY notes play while
+            the editor is open.
+          - Install a PyObjC NSEvent local monitor so keyboard events reach
+            our callbacks even when the plugin editor has Cocoa focus.
+          - On close, stop immediately so process() cannot race with JUCE's
+            editor teardown, then restart 300 ms later.
+        """
+        track = self._vst_manager.get_track(self._channel)
+        if not track or not track._plugin:
+            QMessageBox.warning(self, "Native Editor",
+                "No VST plugin is loaded on this channel.")
+            return
+        if not hasattr(track._plugin, "show_editor"):
+            QMessageBox.warning(self, "Native Editor",
+                f"'{track.name}' does not expose a native GUI editor.\n\n"
+                "Use the parameter sliders above to adjust the sound.")
+            return
+
+        self._controller.set_active_channel(self._channel)
+        self._controller.reset_key_states()
+
+        player = self._vst_manager._rt_players.get(self._channel)
+
+        # Phase 1 — stop before open (prevents JUCE-init / CoreAudio conflict).
+        if player:
+            player.stop()
+
+        # Phase 2 — schedule audio restart inside the editor session.
+        # show_editor() runs the macOS CFRunLoop so Qt timers fire normally.
+        # 200 ms gives JUCE enough time to finish editor init before the audio
+        # callback starts calling process() concurrently.
+        _start_timer: Optional[QTimer] = None
+        if player:
+            _start_timer = QTimer()
+            _start_timer.setSingleShot(True)
+            _start_timer.timeout.connect(player.start)
+            _start_timer.start(200)
+
+        from . import macos_key_hook
+        _key_monitor = macos_key_hook.install(
+            self._controller.handle_key_press,
+            self._controller.handle_key_release,
+        )
+
+        try:
+            track._plugin.show_editor()
+        except Exception as exc:
+            QMessageBox.warning(self, "Native Editor",
+                f"Could not open native editor:\n{exc}")
+        finally:
+            # Cancel the restart timer if the editor was closed within 200 ms.
+            if _start_timer is not None:
+                _start_timer.stop()
+
+            macos_key_hook.remove(_key_monitor)
+            self._controller.reset_key_states()
+
+            # Phase 3 — stop immediately on close so process() cannot race
+            # with JUCE's editor teardown, then restart after 300 ms.
+            if player:
+                player.stop()
+            if player:
+                QTimer.singleShot(300, player.start)
+
+        # Restore Qt keyboard focus.
+        main_win = self.parent()
+        while main_win is not None and main_win.parent() is not None:
+            main_win = main_win.parent()
+        if main_win is not None:
+            main_win.activateWindow()
+            main_win.raise_()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Export Dialog
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ExportDialog(QDialog):
+    """Choose export format (WAV / MP3 / AAC), filename, and render."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("✦  Export Audio")
+        self.setMinimumWidth(440)
+        self.setStyleSheet(STYLESHEET)
+
+        self._fmt: str = "wav"
+
+        root = QVBoxLayout(self)
+        root.setSpacing(12)
+
+        root.addWidget(_label("EXPORT AUDIO", C["gold"], 13, True))
+
+        # ── Format ────────────────────────────────────────────────────────
+        fmt_box = QGroupBox("Format")
+        fmt_box.setStyleSheet(
+            f"QGroupBox {{ color:{C['text_dim']}; border:1px solid rgba(0,229,255,0.2);"
+            f" border-radius:5px; margin-top:8px; }}"
+            f"QGroupBox::title {{ subcontrol-origin:margin; left:8px; }}")
+        fmt_lay = QHBoxLayout(fmt_box)
+        self._wav_radio = QRadioButton("WAV  (lossless)")
+        self._mp3_radio = QRadioButton("MP3  (192 kbps)")
+        self._aac_radio = QRadioButton("AAC  (.m4a, 192 kbps)")
+        self._wav_radio.setChecked(True)
+        for rb in (self._wav_radio, self._mp3_radio, self._aac_radio):
+            rb.setStyleSheet(f"color:{C['text']};")
+            fmt_lay.addWidget(rb)
+        self._wav_radio.toggled.connect(lambda c: self._on_fmt_changed("wav") if c else None)
+        self._mp3_radio.toggled.connect(lambda c: self._on_fmt_changed("mp3") if c else None)
+        self._aac_radio.toggled.connect(lambda c: self._on_fmt_changed("aac") if c else None)
+        root.addWidget(fmt_box)
+
+        # ── Filename ──────────────────────────────────────────────────────
+        file_box = QGroupBox("Output file")
+        file_box.setStyleSheet(
+            f"QGroupBox {{ color:{C['text_dim']}; border:1px solid rgba(0,229,255,0.2);"
+            f" border-radius:5px; margin-top:8px; }}"
+            f"QGroupBox::title {{ subcontrol-origin:margin; left:8px; }}")
+        file_lay = QHBoxLayout(file_box)
+        self._path_edit = QLineEdit(os.path.expanduser("~/Untitled.wav"))
+        self._path_edit.setStyleSheet(
+            f"background:{C['deep']}; color:{C['text']};"
+            f" border:1px solid rgba(0,229,255,0.2); border-radius:4px; padding:4px;")
+        browse_btn = QPushButton("Browse…")
+        browse_btn.setFixedWidth(80)
+        browse_btn.clicked.connect(self._browse)
+        file_lay.addWidget(self._path_edit, stretch=1)
+        file_lay.addWidget(browse_btn)
+        root.addWidget(file_box)
+
+        root.addStretch()
+
+        # ── Buttons ───────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        export = QPushButton("Export")
+        export.setStyleSheet(
+            f"QPushButton {{ background:rgba(255,170,0,0.15);"
+            f" color:{C['gold']}; border:1px solid rgba(255,170,0,0.45);"
+            f" border-radius:4px; padding:6px 20px; }}"
+            f"QPushButton:hover {{ background:rgba(255,170,0,0.35); }}")
+        export.clicked.connect(self.accept)
+        btn_row.addWidget(cancel)
+        btn_row.addWidget(export)
+        root.addLayout(btn_row)
+
+    def _on_fmt_changed(self, fmt: str) -> None:
+        self._fmt = fmt
+        ext = {"mp3": ".mp3", "aac": ".m4a"}.get(fmt, ".wav")
+        self._path_edit.setText(os.path.splitext(self._path_edit.text())[0] + ext)
+
+    def _browse(self) -> None:
+        filters = {
+            "mp3": ("MP3 Audio (*.mp3);;All Files (*)", ".mp3"),
+            "aac": ("AAC Audio (*.m4a);;All Files (*)", ".m4a"),
+        }
+        filt, ext = filters.get(self._fmt, ("WAV Audio (*.wav);;All Files (*)", ".wav"))
+        default = os.path.splitext(self._path_edit.text())[0] + ext
+        path, _ = QFileDialog.getSaveFileName(self, "Export Audio", default, filt)
+        if path:
+            self._path_edit.setText(path)
+
+    def result_path(self) -> str:
+        return self._path_edit.text()
+
+    def result_format(self) -> str:
+        if self._mp3_radio.isChecked():
+            return "mp3"
+        if self._aac_radio.isChecked():
+            return "aac"
+        return "wav"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Add Track Dialog  (re-styled but same logic)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AddTrackDialog(QDialog):
+    """GM instrument browser with crystal theme."""
+
+    def __init__(self, engine: AudioEngine,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._engine = engine
+        self._result_track:     Optional[MidiTrack]       = None
+        self._result_plugin:    Optional[InstrumentPlugin] = None
+        self._result_vst_track: Optional[VstTrack]        = None
+
+        self.setWindowTitle("✦  Add Instrument Track")
+        self.setMinimumSize(600, 500)
+        self.setStyleSheet(STYLESHEET)
+
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(14, 14, 14, 14)
+
+        # Header
+        hdr = _label("SELECT INSTRUMENT", C["cyan"], 13, True)
+        hdr.setStyleSheet(
+            f"color:{C['cyan']}; font-size:13px; font-weight:bold;"
+            f" letter-spacing:3px; background:transparent;"
+        )
+        root.addWidget(hdr)
+
+        # SF2 picker row
+        sf2_row = QHBoxLayout()
+        sf2_row.addWidget(_label("SOUNDFONT", C["text_dim"], 10))
+        self._sf2_combo = QComboBox()
+        self._sf2_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        sf2_files = AudioEngine.get_available_sf2_files()
+        for p in sf2_files:
+            self._sf2_combo.addItem(os.path.basename(p), userData=p)
+        if not sf2_files:
+            self._sf2_combo.addItem("— no SF2 found —", userData="")
+        sf2_row.addWidget(self._sf2_combo)
+        browse = QPushButton("Browse…")
+        browse.setFixedWidth(90)
+        browse.clicked.connect(self._browse)
+        sf2_row.addWidget(browse)
+        root.addLayout(sf2_row)
+
+        # Category / Preset splitter
+        sp = QSplitter(Qt.Horizontal)
+        self._cat_list = QListWidget()
+        self._cat_list.setFixedWidth(155)
+        for cat in GM_INSTRUMENTS:
+            self._cat_list.addItem(QListWidgetItem(cat))
+        self._cat_list.currentRowChanged.connect(self._on_cat)
+        sp.addWidget(self._cat_list)
+
+        self._pre_list = QListWidget()
+        self._pre_list.currentRowChanged.connect(self._on_pre)
+        sp.addWidget(self._pre_list)
+
+        sp.setStretchFactor(0, 0)
+        sp.setStretchFactor(1, 1)
+        root.addWidget(sp, stretch=1)
+
+        # Track name row
+        nm_row = QHBoxLayout()
+        nm_row.addWidget(_label("TRACK NAME", C["text_dim"], 10))
+        self._name_edit = QLineEdit()
+        self._name_edit.setPlaceholderText("e.g.  Crystal Piano Melody")
+        nm_row.addWidget(self._name_edit)
+        root.addLayout(nm_row)
+
+        # OK / Cancel
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btn_row.addWidget(cancel)
+        ok = QPushButton("✦  Add SF2 Track")
+        ok.setDefault(True)
+        ok.setStyleSheet(
+            f"QPushButton {{ background:rgba(0,229,255,0.15);"
+            f" border:1px solid {C['cyan']}; color:{C['cyan']};"
+            f" border-radius:5px; padding:6px 18px; }}"
+            f"QPushButton:hover {{ background:rgba(0,229,255,0.3); }}"
+        )
+        ok.clicked.connect(self._on_ok)
+        btn_row.addWidget(ok)
+        root.addLayout(btn_row)
+
+        # VST alternative — opens a separate browser dialog
+        vst_sep = QFrame()
+        vst_sep.setFrameShape(QFrame.HLine)
+        vst_sep.setStyleSheet(f"color:rgba(153,69,255,0.3);")
+        root.addWidget(vst_sep)
+
+        vst_row = QHBoxLayout()
+        vst_hint = _label("No SoundFont?  Load a VST3 or AU plugin instead:",
+                           C["text_dim"], 10)
+        vst_row.addWidget(vst_hint)
+        vst_row.addStretch()
+        vst_btn = QPushButton("⬡  Load VST / AU Plugin…")
+        vst_btn.setStyleSheet(
+            f"QPushButton {{ background:rgba(153,69,255,0.12);"
+            f" color:{C['purple']}; border:1px solid rgba(153,69,255,0.4);"
+            f" border-radius:4px; padding:5px 14px; }}"
+            f"QPushButton:hover {{ background:rgba(153,69,255,0.28); }}"
+        )
+        vst_btn.clicked.connect(self._on_load_vst)
+        vst_row.addWidget(vst_btn)
+        root.addLayout(vst_row)
+
+        self._cat_list.setCurrentRow(0)
+
+    def _on_cat(self, row: int) -> None:
+        if row < 0:
+            return
+        cat = self._cat_list.item(row).text()
+        self._pre_list.clear()
+        for preset, bank, name in GM_INSTRUMENTS.get(cat, []):
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, (preset, bank, name))
+            self._pre_list.addItem(item)
+        self._pre_list.setCurrentRow(0)
+
+    def _on_pre(self, row: int) -> None:
+        if row < 0:
+            return
+        item = self._pre_list.item(row)
+        if item:
+            self._name_edit.setText(item.data(Qt.UserRole)[2])
+
+    def _browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select SoundFont", os.path.expanduser("~"),
+            "SoundFont Files (*.sf2);;All Files (*)"
+        )
+        if path:
+            self._sf2_combo.insertItem(0, os.path.basename(path), userData=path)
+            self._sf2_combo.setCurrentIndex(0)
+
+    def _on_ok(self) -> None:
+        sf2: str = self._sf2_combo.currentData() or ""
+        if not sf2 or not os.path.isfile(sf2):
+            QMessageBox.warning(self, "No SoundFont",
+                "Please select a valid .sf2 file or click Browse…")
+            return
+        pre_item = self._pre_list.currentItem()
+        if pre_item is None:
+            QMessageBox.warning(self, "No Instrument",
+                "Please select an instrument.")
+            return
+        preset, bank, preset_name = pre_item.data(Qt.UserRole)
+        name  = self._name_edit.text().strip() or preset_name
+        is_dm = (bank == 128)
+        ch    = self._engine.next_free_channel(is_drums=is_dm)
+        if ch == -1:
+            QMessageBox.warning(self, "No Free Channel",
+                "All 16 MIDI channels are occupied. Remove a track first.")
+            return
+        col = C["tracks"][ch % len(C["tracks"])]
+        self._result_track  = MidiTrack(name=name, channel=ch, color=col)
+        self._result_plugin = InstrumentPlugin(
+            name=name, sf2_path=sf2, bank=bank, preset=preset, channel=ch)
+        self.accept()
+
+    def _on_load_vst(self) -> None:
+        """Open the VST browser; if a plugin is chosen, create a VstTrack and accept."""
+        dlg = VstBrowserDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        path = dlg.result_path()
+        name = dlg.result_name()
+        if not path:
+            return
+        ch = self._engine.next_free_channel(is_drums=False)
+        if ch == -1:
+            QMessageBox.warning(self, "No Free Channel",
+                "All 16 MIDI channels are occupied. Remove a track first.")
+            return
+        col = C["tracks"][ch % len(C["tracks"])]
+        self._result_vst_track = VstTrack(
+            name=name, plugin_path=path, channel=ch, color=col)
+        self.accept()
+
+    def result_track(self)     -> Optional[MidiTrack]:       return self._result_track
+    def result_plugin(self)    -> Optional[InstrumentPlugin]: return self._result_plugin
+    def result_vst_track(self) -> Optional[VstTrack]:        return self._result_vst_track
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Track Arrangement View
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TrackArrangeView(QWidget):
+    """
+    Arrangement timeline — one horizontal lane per MIDI track plus one lane
+    per imported audio track.
+
+    MIDI track lanes show individual MidiClip blocks.  Each block is
+    draggable (body) and resizable (right-edge grip).  Left-clicking a
+    clip selects it and opens it in the piano roll.  Right-clicking shows
+    a context menu (Delete Clip / Duplicate Clip).  Clicking an empty
+    part of the track lane creates a new empty clip.
+
+    Audio track lanes show their AudioClip block.  Right-clicking the
+    track header or the clip removes the audio track.
+
+    Left column  : track name / channel / note-count labels.
+                   Right-click MIDI track header → change instrument or remove.
+    Right area   : ruler + timeline with clip blocks.
+    """
+
+    track_selected               = Signal(int)          # channel
+    clip_selected                = Signal(int, int)     # channel, clip_id
+    clip_edit_requested          = Signal(int, int)     # channel, clip_id  (simple click, no drag)
+    clip_moved                   = Signal(int, int, float)   # channel, clip_id, new_start_beat
+    clip_resized                 = Signal(int, int, float)   # channel, clip_id, new_duration_beats
+    clip_deleted                 = Signal(int, int)     # channel, clip_id
+    clip_duplicated              = Signal(int, int)     # channel, clip_id
+    clip_create_requested        = Signal(int, float)   # channel, beat_position
+    audio_clip_moved             = Signal(int, int, float)   # track_id, clip_id, new_start_beat
+    audio_clip_resized           = Signal(int, int, float)   # track_id, clip_id, new_duration_secs
+    audio_clip_deleted           = Signal(int, int)     # track_id, clip_id
+    audio_clip_duplicated        = Signal(int, int)     # track_id, clip_id
+    scroll_x_changed             = Signal(float)        # view_x
+    loop_region_changed          = Signal(float, float) # start_beat, end_beat
+    seek_requested               = Signal(float)        # beat position
+    change_instrument_requested  = Signal(int)          # channel
+    remove_track_requested       = Signal(int)          # channel
+    audio_track_remove_requested = Signal(int)          # track_id
+    audio_clip_drop_requested    = Signal(float)        # kept for toolbar-flow compat
+
+    TRACK_HEIGHT    : int = 60
+    AUDIO_ROW_HEIGHT: int = 52
+    HEADER_WIDTH    : int = 168
+    BEAT_WIDTH      : int = 18   # default; overridden per-instance for zoom
+    RULER_HEIGHT    : int = 24
+    RESIZE_GRIP     : int = 8    # right-edge resize handle width (pixels)
+
+    ZOOM_MIN: int = 4
+    ZOOM_MAX: int = 80
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._tracks:         List[MidiTrack]  = []
+        self._audio_tracks:   List[AudioTrack] = []
+        self._active_channel: int   = 0
+        self._selected_clip_id: int = -1   # clip_id of the highlighted clip
+        self._view_x:         float = 0.0
+        self._total_beats:    float = 32.0
+        self._bpm:            float = 120.0
+        self.BEAT_WIDTH:      int   = 18   # instance copy — zoom changes this
+
+        # Loop region display
+        self._loop_enabled: bool  = False
+        self._loop_start:   float = 0.0
+        self._loop_end:     float = 8.0
+
+        # Ruler interaction (click = seek, hold+drag = loop)
+        self._ruler_pressed:      bool  = False
+        self._ruler_press_x:      int   = 0
+        self._ruler_press_beat:   float = 0.0
+        self._ruler_loop_origin:  Optional[float] = None  # set when drag starts
+
+        # Waveform peak cache: path → list of normalised peak values
+        self._waveform_cache: Dict[str, Optional[List[float]]] = {}
+
+        # Clip drag / resize state (shared by MIDI and audio clips)
+        self._clip_drag_mode:       str   = "none"   # "move" | "resize" | "none"
+        self._drag_track_key:       int   = -1   # channel (MIDI) or track_id (audio)
+        self._drag_clip_id:         int   = -1
+        self._drag_kind:            str   = "midi"   # "midi" | "audio"
+        self._drag_beat_offset:     float = 0.0   # click offset within clip (beats)
+        self._drag_clip_orig_start: float = 0.0
+        self._drag_clip_orig_dur:   float = 4.0   # beats (MIDI) or seconds (audio)
+        self._drag_start_x:         int   = 0
+
+        # Kept for legacy (was _drag_channel)
+        self._drag_channel:         int   = -1
+
+        self.setMouseTracking(True)
+        self.setStyleSheet(f"background:{C['abyss']};")
+        self._resize_widget()
+
+    # ── Public API ─────────────────────────────────────────────────────
+
+    def set_tracks(self, tracks: List[MidiTrack]) -> None:
+        self._tracks = list(tracks)
+        self._resize_widget()
+        self.update()
+
+    def set_audio_tracks(self, audio_tracks: List[AudioTrack]) -> None:
+        self._audio_tracks = list(audio_tracks)
+        self._resize_widget()
+        self.update()
+
+    def set_audio_clips(self, clips) -> None:
+        """Legacy stub — audio clips now live in per-track AudioTrack objects."""
+        pass
+
+    def set_active_channel(self, ch: int) -> None:
+        self._active_channel = ch
+        self.update()
+
+    def set_view_x(self, vx: float) -> None:
+        self._view_x = max(0.0, vx)
+        self.update()
+
+    def set_total_beats(self, beats: float) -> None:
+        self._total_beats = beats
+        self.update()
+
+    def set_bpm(self, bpm: float) -> None:
+        self._bpm = max(20.0, bpm)
+        self.update()
+
+    def set_loop_region(self, enabled: bool, start: float, end: float) -> None:
+        self._loop_enabled = enabled
+        self._loop_start   = max(0.0, start)
+        self._loop_end     = max(self._loop_start + 0.25, end)
+        self.update()
+
+    def set_zoom(self, beat_width: int) -> None:
+        self.BEAT_WIDTH = max(self.ZOOM_MIN, min(self.ZOOM_MAX, beat_width))
+        self.update()
+
+    def zoom_in(self) -> None:
+        steps = [4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 80]
+        for s in steps:
+            if s > self.BEAT_WIDTH:
+                self.set_zoom(s)
+                return
+
+    def zoom_out(self) -> None:
+        steps = [4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 80]
+        for s in reversed(steps):
+            if s < self.BEAT_WIDTH:
+                self.set_zoom(s)
+                return
+
+    # ── Internal geometry ──────────────────────────────────────────────
+
+    def _resize_widget(self) -> None:
+        h = (self.RULER_HEIGHT
+             + len(self._tracks) * self.TRACK_HEIGHT
+             + len(self._audio_tracks) * self.AUDIO_ROW_HEIGHT)
+        self.setFixedHeight(max(80, h))
+
+    def _midi_track_y(self, idx: int) -> int:
+        return self.RULER_HEIGHT + idx * self.TRACK_HEIGHT
+
+    def _audio_track_y(self, idx: int) -> int:
+        return (self.RULER_HEIGHT
+                + len(self._tracks) * self.TRACK_HEIGHT
+                + idx * self.AUDIO_ROW_HEIGHT)
+
+    def _beat_to_x(self, beat: float) -> int:
+        return self.HEADER_WIDTH + int((beat - self._view_x) * self.BEAT_WIDTH)
+
+    def _x_to_beat(self, x: int) -> float:
+        return (x - self.HEADER_WIDTH) / self.BEAT_WIDTH + self._view_x
+
+    def _find_clip_at(self, mx: int, my: int):
+        """
+        Hit-test (mx, my) against all visible clip blocks.
+
+        Returns (channel_or_id, clip, row_type, hit_type) where:
+            row_type = "midi" | "audio"
+            hit_type = "body" | "resize"
+        or (None, None, None, None) if nothing was hit.
+        """
+        for idx, track in enumerate(self._tracks):
+            y = self._midi_track_y(idx)
+            if not (y <= my < y + self.TRACK_HEIGHT):
+                continue
+            for clip in track.clips:
+                cx = self._beat_to_x(clip.start_beat)
+                cw = max(20, int(clip.duration * self.BEAT_WIDTH))
+                if cx <= mx <= cx + cw:
+                    hit = ("resize"
+                           if mx >= cx + cw - self.RESIZE_GRIP
+                           else "body")
+                    return track.channel, clip, "midi", hit
+            return None, None, None, None
+
+        for idx, atrack in enumerate(self._audio_tracks):
+            y = self._audio_track_y(idx)
+            if not (y <= my < y + self.AUDIO_ROW_HEIGHT):
+                continue
+            secs_per_beat = 60.0 / max(20.0, self._bpm)
+            for aclip in atrack.clips:
+                cx = self._beat_to_x(aclip.start_beat)
+                dur_b = (aclip.duration_seconds / secs_per_beat
+                         if aclip.duration_seconds > 0 else 4.0)
+                cw = max(40, int(dur_b * self.BEAT_WIDTH))
+                if cx <= mx <= cx + cw:
+                    hit = ("resize"
+                           if mx >= cx + cw - self.RESIZE_GRIP
+                           else "body")
+                    return atrack.track_id, aclip, "audio", hit
+            return None, None, None, None
+
+        return None, None, None, None
+
+    # ── Painting ───────────────────────────────────────────────────────
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w = self.width()
+        p.fillRect(0, 0, w, self.height(), QColor(C["abyss"]))
+        p.setPen(QPen(QColor(0, 229, 255, 30), 1))
+        p.drawLine(self.HEADER_WIDTH, 0, self.HEADER_WIDTH, self.height())
+        self._draw_ruler(p, w)
+        for idx, track in enumerate(self._tracks):
+            self._draw_midi_lane(p, track, self._midi_track_y(idx), w)
+        for idx, atrack in enumerate(self._audio_tracks):
+            self._draw_audio_lane(p, atrack, self._audio_track_y(idx), w)
+
+    def _draw_ruler(self, p: QPainter, w: int) -> None:
+        p.fillRect(0, 0, w, self.RULER_HEIGHT, QColor(C["void"]))
+        p.fillRect(0, 0, self.HEADER_WIDTH, self.RULER_HEIGHT, QColor(C["abyss"]))
+
+        # Loop region overlay
+        if self._loop_enabled or self._ruler_loop_origin is not None:
+            xs = self._beat_to_x(self._loop_start)
+            xe = self._beat_to_x(self._loop_end)
+            if xs < w and xe > self.HEADER_WIDTH:
+                fill_x = max(self.HEADER_WIDTH, xs)
+                fill_w = min(w, xe) - fill_x
+                p.fillRect(fill_x, 0, fill_w, self.RULER_HEIGHT,
+                           QColor(153, 69, 255, 50))
+                p.setPen(QPen(QColor(C["purple"]), 2))
+                if self.HEADER_WIDTH <= xs <= w:
+                    p.drawLine(xs, 0, xs, self.RULER_HEIGHT)
+                if self.HEADER_WIDTH <= xe <= w:
+                    p.drawLine(xe, 0, xe, self.RULER_HEIGHT)
+
+        p.setFont(QFont("Arial", 8))
+        beat = 0
+        while beat <= self._total_beats + 8:
+            x = self._beat_to_x(beat)
+            if self.HEADER_WIDTH <= x <= w:
+                if beat % 4 == 0:
+                    p.setPen(QColor(C["cyan"]))
+                    p.drawLine(x, 8, x, self.RULER_HEIGHT - 1)
+                    p.drawText(x + 3, self.RULER_HEIGHT - 4,
+                               f"{int(beat // 4) + 1}")
+                else:
+                    p.setPen(QPen(QColor(0, 229, 255, 22), 1))
+                    p.drawLine(x, 14, x, self.RULER_HEIGHT - 1)
+            beat += 1
+        p.setPen(QPen(QColor(0, 229, 255, 40), 1))
+        p.drawLine(self.HEADER_WIDTH, self.RULER_HEIGHT - 1,
+                   w, self.RULER_HEIGHT - 1)
+
+    def _draw_midi_lane(self, p: QPainter, track: MidiTrack,
+                        y: int, w: int) -> None:
+        is_active = (track.channel == self._active_channel)
+        color = QColor(track.color)
+        h = self.TRACK_HEIGHT
+
+        # Header
+        hbg = QColor(C["surface"]) if is_active else QColor(C["deep"])
+        p.fillRect(0, y, self.HEADER_WIDTH, h, hbg)
+        p.fillRect(0, y + 1, 4, h - 2, color)
+        name_col = color if is_active else QColor(C["text"])
+        p.setPen(name_col)
+        p.setFont(QFont("Arial", 10, QFont.Bold if is_active else QFont.Normal))
+        p.drawText(10, y + 18, track.name[:20])
+        p.setPen(QColor(C["text_dim"]))
+        p.setFont(QFont("Arial", 8))
+        p.drawText(10, y + 32, f"CH {track.channel + 1:02d}")
+        total_notes = sum(len(c.notes) for c in track.clips)
+        hint = (f"{total_notes} notes · {len(track.clips)} clip(s)"
+                if track.clips else "right-click → change instrument")
+        p.drawText(10, y + 46, hint)
+
+        # Timeline background
+        p.fillRect(self.HEADER_WIDTH, y, w - self.HEADER_WIDTH, h,
+                   QColor(C["abyss"]))
+
+        # Faint beat grid when empty
+        if not track.clips:
+            p.setPen(QPen(QColor(0, 229, 255, 7), 1))
+            beat = 0
+            while beat <= self._total_beats:
+                x = self._beat_to_x(beat)
+                if self.HEADER_WIDTH <= x <= w:
+                    p.drawLine(x, y, x, y + h)
+                beat += 4
+
+        # Clip blocks
+        for clip in track.clips:
+            self._draw_clip_block(p, clip, track, y, h)
+
+        p.setPen(QPen(QColor(0, 229, 255, 14), 1))
+        p.drawLine(0, y + h - 1, w, y + h - 1)
+
+    def _draw_clip_block(self, p: QPainter, clip: MidiClip,
+                         track: MidiTrack, y: int, h: int) -> None:
+        color = QColor(track.color)
+        is_sel = (clip.clip_id == self._selected_clip_id)
+
+        bx = self._beat_to_x(clip.start_beat)
+        bw = max(20, int(clip.duration * self.BEAT_WIDTH))
+
+        alpha_bg  = 60 if is_sel else 28
+        alpha_bdr = 220 if is_sel else 110
+        bg_col  = QColor(color.red(), color.green(), color.blue(), alpha_bg)
+        bdr_col = QColor(color.red(), color.green(), color.blue(), alpha_bdr)
+        block = QRectF(bx, y + 3, bw, h - 6)
+        p.fillRect(block, bg_col)
+        p.setPen(QPen(bdr_col, 1.5 if is_sel else 1.0))
+        p.drawRoundedRect(block, 4, 4)
+
+        clip_label = clip.name if clip.name else track.name[:16]
+        p.setFont(QFont("Arial", 8))
+        p.setPen(QColor(color.red(), color.green(), color.blue(), 210))
+        p.drawText(bx + 6, y + 16, clip_label[:20])
+
+        # Mini note preview inside the clip block
+        if clip.notes:
+            pmin = min(n.pitch for n in clip.notes)
+            pmax = max(n.pitch for n in clip.notes)
+            span = max(pmax - pmin, 12)
+            area_h = h - 20
+            p.setPen(QPen(color, 1.5))
+            for note in clip.notes:
+                nx = bx + int(note.start_beat * self.BEAT_WIDTH)
+                nw_px = max(2, int(note.duration * self.BEAT_WIDTH) - 1)
+                nt = y + 8 + area_h - int((note.pitch - pmin) / span * area_h)
+                if bx - 2 <= nx <= bx + bw + 2:
+                    p.drawLine(nx, nt, min(nx + nw_px, bx + bw - 2), nt)
+
+        # Resize grip indicator — bright line on right edge
+        p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 160), 2))
+        p.drawLine(bx + bw - 2, y + 6, bx + bw - 2, y + h - 6)
+
+    def _draw_audio_lane(self, p: QPainter, atrack: AudioTrack,
+                         y: int, w: int) -> None:
+        h = self.AUDIO_ROW_HEIGHT
+        color = QColor(atrack.color)
+
+        # Header
+        p.fillRect(0, y, self.HEADER_WIDTH, h, QColor(C["deep"]))
+        p.fillRect(0, y + 1, 4, h - 2, color)
+        p.setPen(color)
+        p.setFont(QFont("Arial", 9, QFont.Bold))
+        p.drawText(10, y + 18, atrack.name[:20])
+        p.setPen(QColor(C["text_dim"]))
+        p.setFont(QFont("Arial", 8))
+        n_clips = len(atrack.clips)
+        p.drawText(10, y + 32,
+                   f"{n_clips} clip(s)  ·  right-click header to remove")
+
+        # Timeline background
+        p.fillRect(self.HEADER_WIDTH, y, w - self.HEADER_WIDTH, h,
+                   QColor(C["abyss"]))
+
+        # Audio clip blocks — width reflects actual audio duration
+        secs_per_beat = 60.0 / max(20.0, self._bpm)
+        for aclip in atrack.clips:
+            cx = self._beat_to_x(aclip.start_beat)
+            dur_b = (aclip.duration_seconds / secs_per_beat
+                     if aclip.duration_seconds > 0 else 4.0)
+            cw = max(40, int(dur_b * self.BEAT_WIDTH))
+            cy, ch2 = y + 4, h - 8
+
+            # Block fill + border
+            p.fillRect(cx, cy, cw, ch2,
+                       QColor(color.red(), color.green(), color.blue(), 28))
+            p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 140), 1))
+            p.drawRoundedRect(QRectF(cx, cy, cw, ch2), 3, 3)
+
+            # ── Waveform peaks ─────────────────────────────────────────
+            if aclip.path not in self._waveform_cache:
+                self._waveform_cache[aclip.path] = _generate_waveform_peaks(aclip.path)
+
+            peaks = self._waveform_cache.get(aclip.path)
+            wave_margin = 4
+            wave_area_h = ch2 - 2 * wave_margin
+            wave_mid    = cy + wave_margin + wave_area_h // 2
+            if peaks:
+                n = len(peaks)
+                bar_w = max(1, cw // n)
+                wc = QColor(color.red(), color.green(), color.blue(), 140)
+                p.setPen(QPen(wc, 1))
+                for i, pk in enumerate(peaks):
+                    bx2 = cx + int(i / n * cw)
+                    if bx2 >= cx + cw - 2:
+                        break
+                    half = max(1, int(pk * wave_area_h // 2))
+                    p.drawLine(bx2, wave_mid - half, bx2, wave_mid + half)
+            else:
+                # Fallback: flat mid-line
+                p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 40), 1))
+                p.drawLine(cx + 2, wave_mid, cx + cw - 3, wave_mid)
+
+            # Label + duration hint (drawn on top of waveform)
+            p.setPen(color)
+            p.setFont(QFont("Arial", 8))
+            p.drawText(cx + 5, cy + 13, aclip.name[:20])
+            if aclip.duration_seconds > 0:
+                p.setPen(QColor(color.red(), color.green(), color.blue(), 150))
+                p.setFont(QFont("Arial", 7))
+                p.drawText(cx + 5, cy + ch2 - 3,
+                           f"{aclip.duration_seconds:.1f}s")
+
+            # Resize grip indicator — bright right edge
+            p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 180), 2))
+            p.drawLine(cx + cw - 2, cy + 3, cx + cw - 2, cy + ch2 - 3)
+
+        p.setPen(QPen(QColor(0, 229, 255, 18), 1))
+        p.drawLine(0, y + h - 1, w, y + h - 1)
+
+    # ── Mouse events ────────────────────────────────────────────────────
+
+    def mousePressEvent(self, ev) -> None:
+        mx, my = ev.x(), ev.y()
+
+        if my < self.RULER_HEIGHT:
+            if ev.button() == Qt.LeftButton and mx > self.HEADER_WIDTH:
+                beat = max(0.0, self._x_to_beat(mx))
+                self._ruler_pressed    = True
+                self._ruler_press_x    = mx
+                self._ruler_press_beat = beat
+                self._ruler_loop_origin = None
+                self.update()
+            return
+
+        # MIDI track rows
+        for idx, track in enumerate(self._tracks):
+            y = self._midi_track_y(idx)
+            if not (y <= my < y + self.TRACK_HEIGHT):
+                continue
+
+            if ev.button() == Qt.RightButton and mx < self.HEADER_WIDTH:
+                menu = QMenu(self)
+                instr_act  = menu.addAction("Change Instrument…")
+                menu.addSeparator()
+                remove_act = menu.addAction("Remove Track")
+                action = menu.exec(ev.globalPosition().toPoint())
+                if action == instr_act:
+                    self.change_instrument_requested.emit(track.channel)
+                elif action == remove_act:
+                    self.remove_track_requested.emit(track.channel)
+                return
+
+            if mx < self.HEADER_WIDTH:
+                self.track_selected.emit(track.channel)
+                return
+
+            _, clip, _, hit = self._find_clip_at(mx, my)
+
+            if clip is not None and ev.button() == Qt.LeftButton:
+                self._selected_clip_id = clip.clip_id
+                self.clip_selected.emit(track.channel, clip.clip_id)
+                if hit == "resize":
+                    self._clip_drag_mode     = "resize"
+                    self._drag_kind          = "midi"
+                    self._drag_channel       = track.channel
+                    self._drag_track_key     = track.channel
+                    self._drag_clip_id       = clip.clip_id
+                    self._drag_clip_orig_dur = clip.duration
+                    self._drag_start_x       = mx
+                else:
+                    self._clip_drag_mode       = "move"
+                    self._drag_kind            = "midi"
+                    self._drag_channel         = track.channel
+                    self._drag_track_key       = track.channel
+                    self._drag_clip_id         = clip.clip_id
+                    self._drag_clip_orig_start = clip.start_beat
+                    self._drag_beat_offset     = self._x_to_beat(mx) - clip.start_beat
+                    self._drag_start_x         = mx
+                self.update()
+                return
+
+            if clip is not None and ev.button() == Qt.RightButton:
+                menu = QMenu(self)
+                del_act = menu.addAction("Delete Clip")
+                dup_act = menu.addAction("Duplicate Clip")
+                action  = menu.exec(ev.globalPosition().toPoint())
+                if action == del_act:
+                    self.clip_deleted.emit(track.channel, clip.clip_id)
+                elif action == dup_act:
+                    self.clip_duplicated.emit(track.channel, clip.clip_id)
+                return
+
+            # Click on empty track timeline → create new clip
+            if ev.button() == Qt.LeftButton:
+                beat = max(0.0, self._x_to_beat(mx))
+                self.clip_create_requested.emit(track.channel, beat)
+                self.track_selected.emit(track.channel)
+            return
+
+        # Audio track rows
+        for idx, atrack in enumerate(self._audio_tracks):
+            y = self._audio_track_y(idx)
+            if not (y <= my < y + self.AUDIO_ROW_HEIGHT):
+                continue
+
+            # Right-click track header → remove entire audio track
+            if ev.button() == Qt.RightButton and mx < self.HEADER_WIDTH:
+                menu = QMenu(self)
+                rem_act = menu.addAction("Remove Audio Track")
+                action = menu.exec(ev.globalPosition().toPoint())
+                if action == rem_act:
+                    self.audio_track_remove_requested.emit(atrack.track_id)
+                return
+
+            _, aclip, _, hit = self._find_clip_at(mx, my)
+
+            if aclip is not None and ev.button() == Qt.LeftButton:
+                if hit == "resize":
+                    secs_per_beat = 60.0 / max(20.0, self._bpm)
+                    self._clip_drag_mode     = "resize"
+                    self._drag_kind          = "audio"
+                    self._drag_track_key     = atrack.track_id
+                    self._drag_clip_id       = aclip.clip_id
+                    self._drag_clip_orig_dur = aclip.duration_seconds
+                    self._drag_start_x       = mx
+                else:
+                    self._clip_drag_mode       = "move"
+                    self._drag_kind            = "audio"
+                    self._drag_track_key       = atrack.track_id
+                    self._drag_clip_id         = aclip.clip_id
+                    self._drag_clip_orig_start = aclip.start_beat
+                    self._drag_beat_offset     = self._x_to_beat(mx) - aclip.start_beat
+                    self._drag_start_x         = mx
+                self.update()
+                return
+
+            if aclip is not None and ev.button() == Qt.RightButton:
+                menu = QMenu(self)
+                dup_act = menu.addAction("Duplicate Clip")
+                del_act = menu.addAction("Delete Clip")
+                action  = menu.exec(ev.globalPosition().toPoint())
+                if action == dup_act:
+                    self.audio_clip_duplicated.emit(atrack.track_id, aclip.clip_id)
+                elif action == del_act:
+                    self.audio_clip_deleted.emit(atrack.track_id, aclip.clip_id)
+                return
+
+            return
+
+    def mouseMoveEvent(self, ev) -> None:
+        mx = ev.x()
+
+        # Ruler: once dragged > 4px, switch from seek to loop-creation
+        if self._ruler_pressed and abs(mx - self._ruler_press_x) > 4:
+            if self._ruler_loop_origin is None:
+                self._ruler_loop_origin = self._ruler_press_beat
+                self._loop_start = self._ruler_loop_origin
+                self._loop_end   = self._ruler_loop_origin + 0.25
+            beat = max(0.0, round(self._x_to_beat(mx) * 4) / 4)
+            origin = self._ruler_loop_origin
+            self._loop_start = min(origin, beat)
+            self._loop_end   = max(origin + 0.25, beat)
+            self.update()
+            return
+
+        if self._clip_drag_mode == "move" and self._drag_clip_id >= 0:
+            new_beat = max(0.0, self._x_to_beat(mx) - self._drag_beat_offset)
+            new_beat = round(new_beat)   # snap to whole beat
+            if self._drag_kind == "audio":
+                self.audio_clip_moved.emit(self._drag_track_key,
+                                           self._drag_clip_id, float(new_beat))
+            else:
+                self.clip_moved.emit(self._drag_channel, self._drag_clip_id,
+                                     float(new_beat))
+            self.update()
+            return
+
+        if self._clip_drag_mode == "resize" and self._drag_clip_id >= 0:
+            dx_beats = (mx - self._drag_start_x) / self.BEAT_WIDTH
+            if self._drag_kind == "audio":
+                secs_per_beat = 60.0 / max(20.0, self._bpm)
+                dx_secs = dx_beats * secs_per_beat
+                new_dur = max(0.1, self._drag_clip_orig_dur + dx_secs)
+                self.audio_clip_resized.emit(self._drag_track_key,
+                                             self._drag_clip_id, new_dur)
+            else:
+                new_dur = max(1.0, round(self._drag_clip_orig_dur + dx_beats))
+                self.clip_resized.emit(self._drag_channel, self._drag_clip_id,
+                                       float(new_dur))
+            self.update()
+            return
+
+        # Update cursor to hint at resize grip
+        _, clip, _, hit = self._find_clip_at(mx, ev.y())
+        if clip is not None and hit == "resize":
+            self.setCursor(Qt.SizeHorCursor)
+        elif clip is not None:
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+
+    def mouseReleaseEvent(self, ev) -> None:
+        if self._ruler_pressed:
+            if self._ruler_loop_origin is not None:
+                # Drag ended: emit loop region
+                if self._loop_end - self._loop_start >= 0.25:
+                    self.loop_region_changed.emit(self._loop_start, self._loop_end)
+            else:
+                # Simple click: seek
+                self.seek_requested.emit(self._ruler_press_beat)
+            self._ruler_pressed     = False
+            self._ruler_loop_origin = None
+            self.update()
+            return
+
+        # Simple click on a MIDI clip (no drag/resize) → open piano roll
+        if (ev.button() == Qt.LeftButton
+                and self._clip_drag_mode == "move"
+                and self._drag_kind == "midi"
+                and self._drag_clip_id >= 0
+                and self._drag_channel >= 0
+                and abs(ev.x() - self._drag_start_x) < 5):
+            self.clip_edit_requested.emit(self._drag_channel, self._drag_clip_id)
+
+        self._clip_drag_mode = "none"
+        self._drag_clip_id   = -1
+        self._drag_track_key = -1
+        self._drag_channel   = -1
+        self._drag_kind      = "midi"
+        self.setCursor(Qt.ArrowCursor)
+
+    def wheelEvent(self, ev) -> None:
+        dx = ev.angleDelta().x()
+        dy = ev.angleDelta().y()
+        if ev.modifiers() & Qt.ControlModifier:
+            # Ctrl+scroll → zoom
+            if dy > 0:
+                self.zoom_in()
+            elif dy < 0:
+                self.zoom_out()
+            return
+        delta = dx if abs(dx) > abs(dy) else -dy
+        self._view_x = max(0.0, self._view_x + delta / 120)
+        self.scroll_x_changed.emit(self._view_x)
+        self.update()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main Window
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MainWindow(QMainWindow):
+    """
+    Crystal-themed top-level window.
+
+    New features vs previous revision:
+        • Right dock: EffectsPanel (per-instrument EQ/Reverb/Comp/Chorus).
+        • Piano roll: ghost-note display for non-active tracks.
+        • Composition-mode toggle on transport bar.
+        • WAV export via FluidSynth CLI.
+        • New Project — clears everything and resets.
+        • Effect chains stored per-channel in _effect_chains dict.
+    """
+
+    def __init__(
+        self,
+        engine: AudioEngine,
+        midi: MidiLogic,
+        controller: ControllerManager,
+    ) -> None:
+        super().__init__()
+        self._engine       = engine
+        self._midi         = midi
+        self._controller   = controller
+        self._vst_manager  = VstManager()           # VST plugin host
+        self._selected_channel: int = 0
+        self._active_clip: Optional[MidiClip] = None   # clip open in piano roll
+        self._effect_chains: Dict[int, EffectChain] = {}
+        self._pygame_sounds: Dict[str, object] = {}
+        self._gamepad_timer: Optional[QTimer] = None   # drives controller.poll_once()
+        self._instrument_names: Dict[int, str] = {}    # channel → current preset name
+        self._note_clipboard:  List[dict]     = []    # copy/paste buffer for piano roll notes
+        self._init_audio_clip_playback()
+
+        self.setWindowTitle("SBS-Synth Master  ✦  Crystal DAW")
+        self.setMinimumSize(1200, 750)
+        self.setStyleSheet(STYLESHEET)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        self._setup_toolbar()
+        self._setup_transport()
+        self._setup_piano_roll()
+        self._setup_mixer()
+        self._setup_effects_dock()
+        self._setup_status_bar()
+        self._wire_signals()
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(50)
+        self._refresh_timer.timeout.connect(self._on_refresh_tick)
+        self._refresh_timer.start()
+
+    # ------------------------------------------------------------------
+    # Audio clip playback initialisation
+    # ------------------------------------------------------------------
+
+    def _init_audio_clip_playback(self) -> None:
+        """Init pygame.mixer for audio clip playback and wire the callback."""
+        try:
+            import pygame
+            pygame.mixer.pre_init(44100, -16, 2, 4096)
+            pygame.mixer.init()
+            self._midi.set_audio_callback(self._play_audio_file)
+            logger.info("pygame.mixer initialised for audio clip playback.")
+        except Exception as exc:
+            logger.warning("pygame.mixer init failed — audio clips will be silent: %s", exc)
+
+    def _play_audio_file(self, path: str, duration_secs: float = 0.0) -> None:
+        """Called from the playback thread to trigger a clip sound."""
+        try:
+            import pygame
+            if path not in self._pygame_sounds:
+                self._pygame_sounds[path] = pygame.mixer.Sound(path)
+            maxtime = int(duration_secs * 1000) if duration_secs > 0 else 0
+            self._pygame_sounds[path].play(maxtime=maxtime)
+        except Exception as exc:
+            logger.warning("Audio clip play error (%s): %s", path, exc)
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _setup_toolbar(self) -> None:
+        tb = QToolBar("Actions")
+        tb.setMovable(False)
+        self.addToolBar(Qt.TopToolBarArea, tb)
+
+        def _btn(label: str, tip: str, slot,
+                 color: str = C["cyan"]) -> QPushButton:
+            b = QPushButton(label)
+            b.setToolTip(tip)
+            b.setFixedHeight(32)
+            b.setStyleSheet(
+                f"QPushButton {{ background:{C['deep']}; color:{color};"
+                f" border:1px solid rgba(0,229,255,0.2); border-radius:5px;"
+                f" padding:0 12px; }}"
+                f"QPushButton:hover {{ border-color:{color};"
+                f" background:rgba(0,229,255,0.1); color:{color}; }}"
+            )
+            b.clicked.connect(slot)
+            return b
+
+        tb.addWidget(_btn("✦ NEW PROJECT",  "Clear all tracks and start fresh",
+                          self._on_new_project, C["purple"]))
+        tb.addSeparator()
+        tb.addWidget(_btn("+ ADD TRACK",    "Add a new instrument track",
+                          self._on_add_track))
+        tb.addWidget(_btn("+ ADD AUDIO CLIP",
+                          "Place an audio sample in the arrangement view",
+                          self._on_add_audio_clip_toolbar, C["gold"]))
+        tb.addSeparator()
+        tb.addWidget(_btn("💾 SAVE MIDI",   "Export tracks to .mid",
+                          self._on_save_midi))
+        tb.addWidget(_btn("📂 OPEN MIDI",   "Import from .mid file",
+                          self._on_open_midi))
+        tb.addWidget(_btn("🎵 EXPORT",      "Export to WAV or MP3",
+                          self._on_export, C["gold"]))
+        tb.addSeparator()
+        tb.addWidget(_btn("🎮 GAMEPAD",     "Connect PS5 DualSense",
+                          self._on_connect_gamepad))
+        tb.addWidget(_btn("⌨ KEY MAP",      "Show keyboard mapping",
+                          self._on_show_map))
+
+    def _setup_transport(self) -> None:
+        self._transport = TransportBar()
+        dock = QDockWidget("TRANSPORT", self)
+        dock.setWidget(self._transport)
+        dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self.addDockWidget(Qt.TopDockWidgetArea, dock)
+
+    def _setup_piano_roll(self) -> None:
+        self._piano_roll   = PianoRollWidget()
+        self._arrange_view = TrackArrangeView()
+        self._clip_lane    = AudioClipLane()   # data backend kept alive
+
+        # ── Page 0: Arrangement view ────────────────────────────────
+        arrange_scroll = QScrollArea()
+        arrange_scroll.setWidget(self._arrange_view)
+        arrange_scroll.setWidgetResizable(True)
+        arrange_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        arrange_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        arrange_scroll.setStyleSheet(f"background:{C['abyss']}; border:none;")
+
+        self._arrange_hscroll = QScrollBar(Qt.Horizontal)
+        self._arrange_hscroll.setRange(0, int(self._arrange_view._total_beats * 4))
+        self._arrange_hscroll.setSingleStep(4)
+        self._arrange_hscroll.setPageStep(32)
+        self._arrange_hscroll.setStyleSheet(f"""
+            QScrollBar:horizontal {{
+                background:{C['abyss']}; height:12px; border:none;
+            }}
+            QScrollBar::handle:horizontal {{
+                background:{C['cyan']}; border-radius:5px; min-width:24px;
+            }}
+            QScrollBar::handle:horizontal:hover {{
+                background:{C['pink']};
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                width:0px;
+            }}
+        """)
+
+        # Zoom toolbar for arrange view
+        _zoom_btn_ss = (
+            f"QPushButton {{ background:{C['deep']}; color:{C['cyan']};"
+            f" border:1px solid rgba(0,229,255,0.25); border-radius:4px;"
+            f" padding:0 10px; font-size:13px; font-weight:bold; }}"
+            f"QPushButton:hover {{ border-color:{C['cyan']}; background:rgba(0,229,255,0.12); }}"
+        )
+        zoom_in_btn  = QPushButton("+")
+        zoom_out_btn = QPushButton("−")
+        zoom_in_btn .setFixedHeight(22)
+        zoom_out_btn.setFixedHeight(22)
+        zoom_in_btn .setFixedWidth(32)
+        zoom_out_btn.setFixedWidth(32)
+        zoom_in_btn .setStyleSheet(_zoom_btn_ss)
+        zoom_out_btn.setStyleSheet(_zoom_btn_ss)
+        zoom_in_btn .setToolTip("Zoom in  (Ctrl+scroll)")
+        zoom_out_btn.setToolTip("Zoom out  (Ctrl+scroll)")
+        zoom_in_btn .clicked.connect(self._arrange_view.zoom_in)
+        zoom_out_btn.clicked.connect(self._arrange_view.zoom_out)
+
+        zoom_lbl = QLabel("ZOOM")
+        zoom_lbl.setStyleSheet(
+            f"color:{C['text_dim']}; font-size:10px; background:transparent;")
+
+        zoom_row = QWidget()
+        zoom_row.setFixedHeight(26)
+        zoom_row.setStyleSheet(
+            f"background:{C['abyss']}; border-bottom:1px solid rgba(0,229,255,0.12);")
+        zr_lay = QHBoxLayout(zoom_row)
+        zr_lay.setContentsMargins(8, 2, 8, 2)
+        zr_lay.setSpacing(4)
+        zr_lay.addStretch()
+        zr_lay.addWidget(zoom_lbl)
+        zr_lay.addWidget(zoom_out_btn)
+        zr_lay.addWidget(zoom_in_btn)
+
+        arrange_panel = QWidget()
+        arrange_panel.setStyleSheet(f"background:{C['abyss']};")
+        ap_lay = QVBoxLayout(arrange_panel)
+        ap_lay.setContentsMargins(0, 0, 0, 0)
+        ap_lay.setSpacing(0)
+        ap_lay.addWidget(zoom_row)
+        ap_lay.addWidget(arrange_scroll, stretch=1)
+        ap_lay.addWidget(self._arrange_hscroll)
+
+        # ── Page 1: Piano roll ──────────────────────────────────────
+
+        # Disable the QScrollArea's own vertical scrollbar.  _view_y in
+        # PianoRollWidget drives rendering; the separate _piano_vscroll
+        # QScrollBar widget (below) provides the visual scroll track that
+        # spans the complete 128-note MIDI range.
+        piano_scroll = QScrollArea()
+        piano_scroll.setWidget(self._piano_roll)
+        piano_scroll.setWidgetResizable(True)
+        piano_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        piano_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        piano_scroll.setStyleSheet(f"background:{C['void']}; border:none;")
+        self._piano_scroll = piano_scroll
+
+        # Vertical scrollbar spanning the full MIDI range (C-1 … G9 = 0 … 127).
+        # Range max = 127 so the thumb position matches view_y directly.
+        self._piano_vscroll = QScrollBar(Qt.Vertical)
+        self._piano_vscroll.setRange(
+            0, PianoRollWidget.PITCH_MAX - PianoRollWidget.PITCH_MIN - 1)
+        self._piano_vscroll.setSingleStep(1)
+        self._piano_vscroll.setPageStep(20)
+        self._piano_vscroll.setStyleSheet(f"""
+            QScrollBar:vertical {{
+                background:{C['abyss']}; width:12px; border:none;
+            }}
+            QScrollBar::handle:vertical {{
+                background:{C['cyan']}; border-radius:5px; min-height:24px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background:{C['pink']};
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height:0px;
+            }}
+        """)
+
+        # Wrapper: piano scroll area + manual scrollbar side-by-side
+        piano_with_scroll = QWidget()
+        piano_with_scroll.setStyleSheet(f"background:{C['void']};")
+        phs_lay = QHBoxLayout(piano_with_scroll)
+        phs_lay.setContentsMargins(0, 0, 0, 0)
+        phs_lay.setSpacing(0)
+        phs_lay.addWidget(piano_scroll, stretch=1)
+        phs_lay.addWidget(self._piano_vscroll)
+
+        # Back button + track title bar
+        self._back_btn = QPushButton("← ARRANGEMENT")
+        self._back_btn.setFixedHeight(28)
+        self._back_btn.setStyleSheet(
+            f"QPushButton {{ background:rgba(0,229,255,0.08);"
+            f" color:{C['cyan']}; border:1px solid rgba(0,229,255,0.35);"
+            f" border-radius:4px; padding:0 10px; font-size:11px; }}"
+            f"QPushButton:hover {{ background:rgba(0,229,255,0.22); }}"
+        )
+
+        # VST editor button (visible only when a VST track is open)
+        self._vst_edit_btn = QPushButton("⚙  VST EDITOR")
+        self._vst_edit_btn.setFixedHeight(28)
+        self._vst_edit_btn.setVisible(False)
+        self._vst_edit_btn.setStyleSheet(
+            f"QPushButton {{ background:rgba(153,69,255,0.12);"
+            f" color:{C['purple']}; border:1px solid rgba(153,69,255,0.45);"
+            f" border-radius:4px; padding:0 10px; font-size:11px; }}"
+            f"QPushButton:hover {{ background:rgba(153,69,255,0.32); }}"
+        )
+
+        self._piano_roll_title = QLabel("PIANO ROLL")
+        self._piano_roll_title.setStyleSheet(
+            f"color:{C['cyan']}; font-size:11px; font-weight:bold;"
+            f" padding:0 12px; background:transparent;"
+        )
+
+        title_bar = QWidget()
+        title_bar.setFixedHeight(34)
+        title_bar.setStyleSheet(
+            f"background:{C['abyss']};"
+            f" border-bottom:1px solid rgba(0,229,255,0.2);"
+        )
+        # Draw / Select mode toggle
+        self._draw_mode_btn = QPushButton("✏ DRAW")
+        self._draw_mode_btn.setCheckable(True)
+        self._draw_mode_btn.setChecked(True)
+        self._draw_mode_btn.setFixedHeight(28)
+        self._draw_mode_btn.setToolTip(
+            "DRAW: click to add notes  |  SELECT: drag to select a group of notes")
+        self._draw_mode_btn.setStyleSheet(
+            f"QPushButton {{ background:rgba(0,229,255,0.08); color:{C['cyan']};"
+            f" border:1px solid rgba(0,229,255,0.35); border-radius:4px;"
+            f" padding:0 10px; font-size:11px; }}"
+            f"QPushButton:checked {{ background:rgba(0,229,255,0.22);"
+            f" color:{C['cyan']}; border-color:{C['cyan']}; }}"
+            f"QPushButton:!checked {{ background:rgba(153,69,255,0.1);"
+            f" color:{C['purple']}; border-color:rgba(153,69,255,0.4); }}"
+            f"QPushButton:hover {{ background:rgba(0,229,255,0.18); }}"
+        )
+        self._draw_mode_btn.toggled.connect(self._on_draw_mode_toggled)
+
+        # Grid size selector
+        grid_lbl = QLabel("GRID")
+        grid_lbl.setStyleSheet(
+            f"color:{C['text_dim']}; font-size:10px; background:transparent;")
+        self._grid_combo = QComboBox()
+        self._grid_combo.addItems(["1/16", "1/8", "1/4", "1/2", "1"])
+        self._grid_combo.setCurrentText("1/16")
+        self._grid_combo.setFixedWidth(60)
+        self._grid_combo.setStyleSheet(
+            f"QComboBox {{ background:{C['deep']}; color:{C['cyan']};"
+            f" border:1px solid rgba(0,229,255,0.3); border-radius:4px;"
+            f" padding:2px 6px; font-size:11px; }}"
+            f"QComboBox::drop-down {{ border:none; }}"
+            f"QComboBox QAbstractItemView {{ background:{C['surface']};"
+            f" color:{C['text']}; selection-background-color:{C['deep']}; }}")
+        self._grid_combo.currentTextChanged.connect(self._piano_roll.set_grid_size)
+
+        tlay = QHBoxLayout(title_bar)
+        tlay.setContentsMargins(6, 3, 6, 3)
+        tlay.setSpacing(8)
+        tlay.addWidget(self._back_btn)
+        tlay.addWidget(self._vst_edit_btn)
+        tlay.addWidget(self._piano_roll_title, stretch=1)
+        tlay.addWidget(self._draw_mode_btn)
+        tlay.addWidget(grid_lbl)
+        tlay.addWidget(self._grid_combo)
+
+        # Velocity lane toggle button
+        self._vel_toggle_btn = QPushButton("≡ VEL")
+        self._vel_toggle_btn.setCheckable(True)
+        self._vel_toggle_btn.setChecked(True)
+        self._vel_toggle_btn.setFixedHeight(28)
+        self._vel_toggle_btn.setToolTip(
+            "Show / hide the velocity lane below the piano roll")
+        self._vel_toggle_btn.setStyleSheet(
+            f"QPushButton {{ background:rgba(153,69,255,0.10); color:{C['purple']};"
+            f" border:1px solid rgba(153,69,255,0.40); border-radius:4px;"
+            f" padding:0 10px; font-size:11px; }}"
+            f"QPushButton:checked {{ background:rgba(153,69,255,0.25);"
+            f" color:{C['purple']}; border-color:{C['purple']}; }}"
+            f"QPushButton:hover {{ background:rgba(153,69,255,0.22); }}"
+        )
+        tlay.addWidget(self._vel_toggle_btn)
+
+        # ── Velocity lane ────────────────────────────────────────────
+        self._velocity_lane = VelocityLaneWidget()
+        self._velocity_lane.setFixedHeight(80)
+
+        # Vertical splitter: piano roll on top, velocity lane on bottom
+        self._piano_vel_splitter = QSplitter(Qt.Vertical)
+        self._piano_vel_splitter.setHandleWidth(4)
+        self._piano_vel_splitter.setStyleSheet(
+            f"QSplitter::handle {{ background:rgba(153,69,255,0.30); }}"
+            f"QSplitter::handle:hover {{ background:{C['purple']}; }}"
+        )
+        self._piano_vel_splitter.addWidget(piano_with_scroll)
+        self._piano_vel_splitter.addWidget(self._velocity_lane)
+        self._piano_vel_splitter.setStretchFactor(0, 1)
+        self._piano_vel_splitter.setStretchFactor(1, 0)
+        self._piano_vel_splitter.setSizes([600, 80])
+
+        piano_panel = QWidget()
+        piano_panel.setStyleSheet(f"background:{C['void']};")
+        pvlay = QVBoxLayout(piano_panel)
+        pvlay.setContentsMargins(0, 0, 0, 0)
+        pvlay.setSpacing(0)
+        pvlay.addWidget(title_bar)
+        pvlay.addWidget(self._piano_vel_splitter, stretch=1)
+
+        # ── Stacked widget ───────────────────────────────────────────
+        self._view_stack = QStackedWidget()
+        self._view_stack.addWidget(arrange_panel)   # index 0
+        self._view_stack.addWidget(piano_panel)     # index 1
+        self._view_stack.setCurrentIndex(0)
+
+        central = QWidget()
+        central.setStyleSheet(f"background:{C['void']};")
+        vlay = QVBoxLayout(central)
+        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setSpacing(0)
+        vlay.addWidget(self._view_stack)
+        self.setCentralWidget(central)
+
+    def _setup_mixer(self) -> None:
+        self._mixer_strips: Dict[int, MixerStrip] = {}
+        self._mixer_inner  = QWidget()
+        self._mixer_inner.setStyleSheet(f"background:{C['abyss']};")
+        self._mixer_layout = QHBoxLayout(self._mixer_inner)
+        self._mixer_layout.setAlignment(Qt.AlignLeft)
+        self._mixer_layout.setContentsMargins(6, 6, 6, 6)
+        self._mixer_layout.setSpacing(3)
+
+        mixer_scroll = QScrollArea()
+        mixer_scroll.setWidget(self._mixer_inner)
+        mixer_scroll.setWidgetResizable(True)
+        mixer_scroll.setFixedHeight(310)
+        mixer_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        mixer_scroll.setStyleSheet(f"background:{C['abyss']}; border:none;")
+
+        dock = QDockWidget("MIXER", self)
+        dock.setWidget(mixer_scroll)
+        self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+
+    def _setup_effects_dock(self) -> None:
+        self._effects_panel = EffectsPanel()
+        scroll = QScrollArea()
+        scroll.setWidget(self._effects_panel)
+        scroll.setWidgetResizable(True)
+        scroll.setFixedWidth(240)
+        scroll.setStyleSheet(f"background:{C['abyss']}; border:none;")
+
+        dock = QDockWidget("EFFECTS", self)
+        dock.setWidget(scroll)
+        self.addDockWidget(Qt.RightDockWidgetArea, dock)
+
+    def _setup_status_bar(self) -> None:
+        sb = QStatusBar()
+        self.setStatusBar(sb)
+        self._st_engine = QLabel("Engine: —")
+        self._st_scale  = QLabel("Scale: —")
+        self._st_beat   = QLabel("♩ 0.00")
+        for w in (self._st_engine, self._st_scale, self._st_beat):
+            w.setStyleSheet(f"color:{C['text_dim']}; font-size:11px; padding:0 8px;")
+        sb.addPermanentWidget(self._st_engine)
+        sb.addPermanentWidget(self._st_scale)
+        sb.addPermanentWidget(self._st_beat)
+
+    def _wire_signals(self) -> None:
+        t = self._transport
+        t.play_clicked.connect(self._on_play)
+        t.stop_clicked.connect(self._on_stop)
+        t.record_clicked.connect(self._on_record_toggled)
+        t.bpm_changed.connect(lambda v: setattr(self._midi, "bpm", v))
+        t.bpm_changed.connect(self._clip_lane.set_bpm)
+        t.panic_btn.clicked.connect(self._engine.all_notes_off)
+        t.scale_combo.currentTextChanged.connect(self._on_scale_changed)
+        t.root_combo .currentTextChanged.connect(self._on_scale_changed)
+        t.octave_spin.valueChanged.connect(self._on_octave_changed)
+        # D-pad octave changes come from the poll thread — use singleShot to
+        # safely marshal the update back onto the GUI thread.
+        self._controller.on_octave_changed = lambda o: QTimer.singleShot(
+            0, lambda val=o: t.octave_spin.setValue(val)
+        )
+        t.bpm_changed.connect(self._arrange_view.set_bpm)
+        t.comp_mode_btn.toggled.connect(self._piano_roll.set_composition_mode)
+        t.loop_btn.toggled.connect(self._on_loop_toggled)
+
+        self._back_btn.clicked.connect(self._show_arrange_view)
+        self._vst_edit_btn.clicked.connect(self._on_open_vst_editor)
+
+        # Piano roll vertical scrollbar — bidirectional sync with _view_y.
+        # view_y_changed fires from wheelEvent and jump_to_pitch so the scrollbar
+        # thumb follows; valueChanged fires when the user drags the thumb so
+        # the piano roll rendering follows.
+        self._piano_roll.view_y_changed.connect(self._piano_vscroll.setValue)
+        self._piano_vscroll.valueChanged.connect(self._on_piano_vscroll)
+
+        self._piano_roll.note_added         .connect(self._on_note_added)
+        self._piano_roll.note_removed       .connect(self._on_note_removed)
+        self._piano_roll.note_moved         .connect(self._on_note_moved)
+        self._piano_roll.note_resized       .connect(self._on_note_resized)
+        self._piano_roll.loop_region_changed.connect(self._on_loop_region_changed)
+        self._piano_roll.seek_requested     .connect(self._on_seek)
+        self._piano_roll.scroll_x_changed   .connect(self._arrange_view.set_view_x)
+        self._piano_roll.scroll_x_changed   .connect(self._clip_lane.set_view_x)
+        self._piano_roll.scroll_x_changed   .connect(self._velocity_lane.set_view_x)
+
+        self._velocity_lane.velocity_changed.connect(self._on_velocity_changed)
+        self._vel_toggle_btn.toggled        .connect(self._on_vel_lane_toggled)
+
+        self._arrange_view.track_selected             .connect(self._on_track_header_selected)
+        self._arrange_view.clip_selected              .connect(self._on_clip_selected)
+        self._arrange_view.clip_edit_requested        .connect(self._on_clip_edit_requested)
+        self._arrange_view.clip_moved                 .connect(self._on_midi_clip_moved)
+        self._arrange_view.clip_resized               .connect(self._on_midi_clip_resized)
+        self._arrange_view.clip_deleted               .connect(self._on_midi_clip_deleted)
+        self._arrange_view.clip_duplicated            .connect(self._on_midi_clip_duplicated)
+        self._arrange_view.clip_create_requested      .connect(self._on_clip_create_requested)
+        self._arrange_view.audio_track_remove_requested.connect(self._on_audio_track_remove)
+        self._arrange_view.audio_clip_moved           .connect(self._on_audio_clip_moved)
+        self._arrange_view.audio_clip_resized         .connect(self._on_audio_clip_resized)
+        self._arrange_view.audio_clip_deleted         .connect(self._on_audio_clip_deleted)
+        self._arrange_view.audio_clip_duplicated      .connect(self._on_audio_clip_duplicated)
+        self._arrange_view.scroll_x_changed           .connect(self._piano_roll.set_view_x)
+        self._arrange_view.scroll_x_changed           .connect(self._clip_lane.set_view_x)
+        self._arrange_view.scroll_x_changed           .connect(self._on_arrange_scroll_x)
+        self._arrange_view.loop_region_changed        .connect(self._on_loop_region_changed)
+        self._arrange_view.seek_requested             .connect(self._on_seek)
+        self._arrange_view.change_instrument_requested.connect(self._on_change_instrument)
+        self._arrange_view.remove_track_requested     .connect(self._on_remove_track)
+        self._arrange_hscroll.valueChanged            .connect(self._on_arrange_hscroll)
+
+        self._clip_lane.clip_added    .connect(self._on_clip_added)
+        self._clip_lane.clip_removed  .connect(self._on_clip_removed)
+        self._clip_lane.scroll_changed.connect(self._on_clip_lane_scroll)
+
+        self._midi.set_note_callback(self._note_event_callback)
+
+    # ------------------------------------------------------------------
+    # Track management
+    # ------------------------------------------------------------------
+
+    def add_track(self, track: MidiTrack, plugin: InstrumentPlugin) -> None:
+        """Add a track to the sequencer, engine, and mixer UI."""
+        self._midi.add_track(track)
+
+        if plugin.sf2_path and os.path.isfile(plugin.sf2_path):
+            self._engine.register_instrument(plugin)
+
+        # Create default effect chain for this channel.
+        self._effect_chains[track.channel] = EffectChain(channel=track.channel)
+
+        strip = MixerStrip(track.channel, track.name, track.color)
+        strip.gain_changed  .connect(self._engine.set_gain)
+        strip.pan_changed   .connect(self._engine.set_pan)
+        strip.mute_toggled  .connect(self._engine.set_mute)
+        strip.solo_toggled  .connect(self._engine.set_solo)
+        strip.track_selected.connect(self._on_track_selected)
+        strip.remove_clicked.connect(self._on_remove_track)
+        strip.name_changed  .connect(self._on_track_renamed)
+
+        # The initial track name IS the instrument preset name
+        self._instrument_names[track.channel] = track.name
+        strip.set_instrument_name(track.name)
+
+        self._mixer_strips[track.channel] = strip
+        self._mixer_layout.addWidget(strip)
+
+        # Always activate the newly added track so recording targets it.
+        self._active_clip = None
+        self._piano_roll.set_active_clip(None)
+        self._on_track_selected(track.channel)
+
+        self._refresh_piano_roll()
+
+    def _remove_track(self, channel: int) -> None:
+        self._engine.all_notes_off(channel)
+        self._engine.unregister_vst_player(channel)
+        self._engine.unregister_instrument(channel)
+        self._vst_manager.remove_track(channel)   # also stops real-time player
+        self._midi.remove_track(channel)
+        self._effect_chains.pop(channel, None)
+        self._instrument_names.pop(channel, None)
+
+        strip = self._mixer_strips.pop(channel, None)
+        if strip:
+            self._mixer_layout.removeWidget(strip)
+            strip.deleteLater()
+
+        if self._selected_channel == channel:
+            remaining = list(self._mixer_strips.keys())
+            if remaining:
+                self._on_track_selected(remaining[0])
+            else:
+                self._selected_channel = 0
+                self._effects_panel.load_chain(
+                    EffectChain(channel=0), self._engine, "No track")
+
+        self._refresh_piano_roll()
+
+    def _refresh_piano_roll(self) -> None:
+        tracks = self._midi.get_all_tracks()
+        self._piano_roll.set_tracks(tracks)
+        self._arrange_view.set_tracks(tracks)
+        self._arrange_view.set_audio_tracks(self._midi.get_audio_tracks())
+        self._arrange_view.set_bpm(self._midi.bpm)
+
+        # Extend beat range to cover all MIDI clips and audio tracks
+        total = 32.0
+        for track in tracks:
+            for clip in track.clips:
+                total = max(total, clip.start_beat + clip.duration + 8.0)
+                for note in clip.notes:
+                    total = max(total, clip.start_beat + note.start_beat + note.duration + 8.0)
+        for atrack in self._midi.get_audio_tracks():
+            for aclip in atrack.clips:
+                dur_beats = aclip.duration_seconds * self._midi.bpm / 60.0
+                total = max(total, aclip.start_beat + dur_beats + 8.0)
+        self._piano_roll.set_total_beats(total)
+        self._arrange_view.set_total_beats(total)
+        self._arrange_hscroll.setMaximum(int(total * 4))
+        self._refresh_velocity_lane()
+
+    def _refresh_velocity_lane(self) -> None:
+        """Sync the velocity lane with the current piano roll note data."""
+        notes, color, _ = self._piano_roll._clip_notes_for_display()
+        self._velocity_lane.set_notes_data(
+            list(notes), color, self._piano_roll._active_channel
+        )
+        self._velocity_lane.set_view_x(self._piano_roll._view_x)
+        self._velocity_lane.set_selected_ids(set(self._piano_roll._selected_ids))
+
+    # ------------------------------------------------------------------
+    # Slots
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Velocity lane slots
+    # ------------------------------------------------------------------
+
+    @Slot(int, int, int)
+    def _on_velocity_changed(self, channel: int, note_id: int, velocity: int) -> None:
+        """Persist a velocity change from the velocity lane to the data model."""
+        self._midi.set_note_velocity(note_id, velocity)
+        # Refresh only the velocity lane — no need to rebuild the full piano roll
+        self._refresh_velocity_lane()
+
+    @Slot(bool)
+    def _on_vel_lane_toggled(self, checked: bool) -> None:
+        """Show or hide the velocity lane, expanding the piano roll to fill the space."""
+        self._velocity_lane.setVisible(checked)
+        if checked:
+            total = self._piano_vel_splitter.height()
+            if total > 0:
+                vel_h = min(120, max(60, total // 6))
+                self._piano_vel_splitter.setSizes([total - vel_h, vel_h])
+            else:
+                self._piano_vel_splitter.setSizes([600, 80])
+
+    # ------------------------------------------------------------------
+    # Loop slots
+    # ------------------------------------------------------------------
+
+    @Slot(bool)
+    def _on_loop_toggled(self, enabled: bool) -> None:
+        self._midi.set_loop_region(enabled, self._midi._loop_start, self._midi._loop_end)
+        self._piano_roll  .set_loop_region(enabled, self._midi._loop_start, self._midi._loop_end)
+        self._clip_lane   .set_loop_region(enabled, self._midi._loop_start, self._midi._loop_end)
+        self._arrange_view.set_loop_region(enabled, self._midi._loop_start, self._midi._loop_end)
+
+    @Slot(float, float)
+    def _on_loop_region_changed(self, start: float, end: float) -> None:
+        enabled = self._transport.loop_btn.isChecked()
+        self._midi.set_loop_region(enabled, start, end)
+        self._clip_lane   .set_loop_region(enabled, start, end)
+        self._arrange_view.set_loop_region(enabled, start, end)
+        self._piano_roll  .set_loop_region(enabled, start, end)
+        # Enable loop automatically when user drags a region
+        if not enabled:
+            self._transport.loop_btn.setChecked(True)
+
+    # ------------------------------------------------------------------
+    # Audio clip slots
+    # ------------------------------------------------------------------
+
+    @Slot(str, float, float)
+    def _on_clip_added(self, path: str, start_beat: float, duration_secs: float) -> None:
+        name = os.path.splitext(os.path.basename(path))[0]
+        self._midi.add_audio_track(path, start_beat, name=name,
+                                   duration_seconds=duration_secs, color=C["gold"])
+        self._clip_lane.set_clips(self._midi.get_clips())
+        self._refresh_piano_roll()
+
+    @Slot(int)
+    def _on_clip_removed(self, clip_id: int) -> None:
+        self._midi.remove_clip(clip_id)
+        self._clip_lane.set_clips(self._midi.get_clips())
+        self._refresh_piano_roll()
+
+    @Slot(float)
+    def _on_clip_lane_scroll(self, view_x: float) -> None:
+        self._piano_roll._view_x = view_x
+        self._piano_roll.update()
+
+    # ------------------------------------------------------------------
+    # Transport slots
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _on_play(self) -> None:
+        self._midi.play()
+        self._st_engine.setText("Engine: ▶ PLAYING")
+
+    @Slot()
+    def _on_stop(self) -> None:
+        self._midi.stop()
+        if self._midi._recording:
+            self._midi.stop_recording()
+            self._transport.record_btn.setChecked(False)
+        self._st_engine.setText("Engine: ■ STOPPED")
+        self._refresh_piano_roll()
+
+    @Slot(bool)
+    def _on_record_toggled(self, armed: bool) -> None:
+        if armed:
+            # If _active_clip belongs to a different track, ignore it so recording
+            # always targets the currently selected instrument.
+            if self._active_clip is not None:
+                track = self._midi.get_track(self._selected_channel)
+                if track is None or self._active_clip not in track.clips:
+                    self._active_clip = None
+
+            # No clip selected → create a new one at the playhead on the active track.
+            if self._active_clip is None:
+                track = self._midi.get_track(self._selected_channel)
+                if track:
+                    self._active_clip = self._midi.create_clip(self._selected_channel, self._midi._playhead_beat)
+
+            ok = self._midi.start_recording(self._selected_channel, into_clip=self._active_clip)
+
+            if not ok:
+                self._transport.record_btn.setChecked(False)
+                QMessageBox.warning(self, "Record",
+                    "Add a track first, then arm record.")
+                return
+            self._st_engine.setText("Engine: ⏺ RECORDING")
+        else:
+            rec_clip = self._midi.last_record_clip   # grab ref before stop finalises
+            self._midi.stop_recording()
+
+            if self._active_clip is not None:
+                # Piano-roll mode: the active clip received notes — refresh the view.
+                self._piano_roll.set_active_clip(self._active_clip)
+                if self._active_clip.notes:
+                    # Scroll horizontally to make the earliest recorded note visible.
+                    first_beat = min(n.start_beat for n in self._active_clip.notes)
+                    self._piano_roll.set_view_x(first_beat)
+                note_count = len(self._active_clip.notes)
+            else:
+                # Arrangement mode: open the recorded clip in the piano roll.
+                note_count = len(rec_clip.notes) if rec_clip else 0
+                if rec_clip and rec_clip.notes:
+                    self._active_clip = rec_clip
+                    self._piano_roll.set_active_clip(rec_clip)
+                    self._show_piano_roll_for_track(self._selected_channel)
+
+            self._refresh_piano_roll()
+            self._st_engine.setText(
+                f"Engine: ■ STOPPED — {note_count} note{'s' if note_count != 1 else ''} recorded"
+            )
+
+    @Slot(int, float, float, int)
+    def _on_note_added(self, ch: int, start: float, dur: float, pitch: int) -> None:
+        if self._active_clip is not None:
+            self._midi.add_note_to_clip(self._active_clip, start, dur, pitch)
+        else:
+            self._midi.add_note_to_track(ch, start, dur, pitch)
+        self._refresh_piano_roll()
+        # Audition the note so the user hears the sound on insert.
+        # Duration is capped at 500 ms so the preview stays snappy.
+        preview_ms = int(min(dur * 60_000.0 / max(1.0, self._midi.bpm), 500))
+        self._engine.note_on(ch, pitch)
+        QTimer.singleShot(preview_ms, lambda p=pitch, c=ch: self._engine.note_off(c, p))
+
+    @Slot(int, int)
+    def _on_note_removed(self, ch: int, note_id: int) -> None:
+        if self._active_clip is not None:
+            self._midi.remove_note_from_clip(self._active_clip, note_id)
+        else:
+            self._midi.remove_note_from_track(ch, note_id)
+        self._refresh_piano_roll()
+        self._st_engine.setText("Engine: Note erased  (right-click to erase)")
+
+    # ── Clip selection / MIDI clip operations ─────────────────────────────────
+
+    @Slot(int, int)
+    def _on_clip_selected(self, channel: int, clip_id: int) -> None:
+        """Highlight the clip for drag/resize — does NOT open the piano roll."""
+        track = self._midi.get_track(channel)
+        if not track:
+            return
+        for clip in track.clips:
+            if clip.clip_id == clip_id:
+                self._active_clip = clip
+                self._piano_roll.set_active_clip(clip)
+                self._on_track_selected(channel)   # keep _selected_channel in sync
+                break
+
+    @Slot(int, int)
+    def _on_clip_edit_requested(self, channel: int, clip_id: int) -> None:
+        """Open the piano roll for a clip (single click with no drag in arrange view)."""
+        self._on_clip_selected(channel, clip_id)
+        self._show_piano_roll_for_track(channel)
+
+    @Slot(int, int, float, int)
+    def _on_note_moved(self, ch: int, note_id: int,
+                       new_beat: float, new_pitch: int) -> None:
+        if self._active_clip is not None:
+            self._midi.move_note_in_clip(
+                self._active_clip, note_id, new_beat, new_pitch)
+        self._refresh_piano_roll()
+
+    @Slot(int, int, float)
+    def _on_note_resized(self, ch: int, note_id: int, new_dur: float) -> None:
+        if self._active_clip is not None:
+            self._midi.resize_note_in_clip(self._active_clip, note_id, new_dur)
+        self._refresh_piano_roll()
+
+    @Slot(int, int, float)
+    def _on_midi_clip_moved(self, channel: int, clip_id: int,
+                            new_start: float) -> None:
+        self._midi.move_clip(channel, clip_id, new_start)
+        self._refresh_piano_roll()
+
+    @Slot(int, int, float)
+    def _on_midi_clip_resized(self, channel: int, clip_id: int,
+                              new_dur: float) -> None:
+        self._midi.resize_clip(channel, clip_id, new_dur)
+        self._refresh_piano_roll()
+
+    @Slot(int, int)
+    def _on_midi_clip_deleted(self, channel: int, clip_id: int) -> None:
+        if self._active_clip and self._active_clip.clip_id == clip_id:
+            self._active_clip = None
+            self._piano_roll.set_active_clip(None)
+        self._midi.delete_clip(channel, clip_id)
+        self._refresh_piano_roll()
+
+    @Slot(int, int)
+    def _on_midi_clip_duplicated(self, channel: int, clip_id: int) -> None:
+        self._midi.duplicate_clip(channel, clip_id)
+        self._refresh_piano_roll()
+
+    @Slot(int, float)
+    def _on_clip_create_requested(self, channel: int, beat: float) -> None:
+        new_clip = self._midi.create_clip(channel, beat, duration=8.0)
+        self._refresh_piano_roll()
+        if new_clip:
+            # Make the new clip the active recording target without opening
+            # the piano roll — the user can click it to open it, or just hit
+            # Record and the notes go directly into this new clip.
+            self._on_clip_selected(channel, new_clip.clip_id)
+
+    @Slot(int)
+    def _on_audio_track_remove(self, track_id: int) -> None:
+        self._midi.remove_audio_track(track_id)
+        self._refresh_piano_roll()
+
+    @Slot(int, int, float)
+    def _on_audio_clip_moved(self, track_id: int, clip_id: int,
+                             new_start_beat: float) -> None:
+        self._midi.move_audio_clip(track_id, clip_id, new_start_beat)
+        self._refresh_piano_roll()
+
+    @Slot(int, int, float)
+    def _on_audio_clip_resized(self, track_id: int, clip_id: int,
+                               new_duration_secs: float) -> None:
+        self._midi.resize_audio_clip(track_id, clip_id, new_duration_secs)
+        self._refresh_piano_roll()
+
+    @Slot(int, int)
+    def _on_audio_clip_deleted(self, track_id: int, clip_id: int) -> None:
+        self._midi.remove_audio_clip(clip_id)
+        self._refresh_piano_roll()
+
+    @Slot(int, int)
+    def _on_audio_clip_duplicated(self, track_id: int, clip_id: int) -> None:
+        self._midi.duplicate_audio_clip(track_id, clip_id)
+        self._refresh_piano_roll()
+
+    @Slot(int, str)
+    def _on_track_renamed(self, channel: int, new_name: str) -> None:
+        track = self._midi.get_track(channel)
+        if track:
+            track.name = new_name
+        if channel == self._selected_channel:
+            self._piano_roll_title.setText(f"PIANO ROLL  —  {new_name}")
+        self._refresh_piano_roll()
+
+    @Slot(int)
+    def _on_track_selected(self, channel: int) -> None:
+        self._selected_channel = channel
+        self._controller.set_active_channel(channel)
+        self._piano_roll.set_active_channel(channel)
+        self._arrange_view.set_active_channel(channel)
+        for ch, strip in self._mixer_strips.items():
+            strip.set_selected(ch == channel)
+
+        track = self._midi.get_track(channel)
+        name  = track.name if track else f"CH {channel + 1}"
+        self._piano_roll_title.setText(f"PIANO ROLL  —  {name}")
+
+        chain = self._effect_chains.get(channel)
+        if chain:
+            self._effects_panel.load_chain(chain, self._engine, name)
+
+    # ── View-switching helpers ─────────────────────────────────────────────
+
+    def _show_arrange_view(self) -> None:
+        self._piano_roll.set_active_clip(None)
+        self._view_stack.setCurrentIndex(0)
+
+    def _on_track_header_selected(self, channel: int) -> None:
+        """Called when user clicks a track header in the arrange view."""
+        # Preserve the active clip only if it belongs to THIS track.
+        # Clicking a different track's header clears it so recording starts fresh.
+        if self._active_clip is not None:
+            t = self._midi.get_track(channel)
+            if t is None or self._active_clip not in t.clips:
+                self._active_clip = None
+        self._piano_roll.set_active_clip(self._active_clip)
+        self._show_piano_roll_for_track(channel)
+
+    def _show_piano_roll_for_track(self, channel: int) -> None:
+        self._on_track_selected(channel)
+        # Show the VST editor button only when the track is a VST instrument
+        self._vst_edit_btn.setVisible(
+            self._vst_manager.get_track(channel) is not None)
+        self._view_stack.setCurrentIndex(1)
+        # Force scroll area to position 0 so widget coordinates are unambiguous
+        self._piano_scroll.horizontalScrollBar().setValue(0)
+        self._piano_scroll.verticalScrollBar().setValue(0)
+        # Re-apply view_x=0 for clip mode in case showEvent fires before this
+        if self._active_clip is not None:
+            self._piano_roll.set_view_x(0.0)
+
+    # ── Instrument-change slot ─────────────────────────────────────────────
+
+    @Slot(int)
+    def _on_change_instrument(self, channel: int) -> None:
+        track = self._midi.get_track(channel)
+        if not track:
+            return
+        dlg = ChangeInstrumentDialog(self._engine, track.name, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        info = dlg.result_plugin_info()
+        if not info:
+            return
+        sf2, bank, preset, preset_name = info
+        # Do NOT overwrite track.name — the user may have given it a custom name.
+        # Store the instrument preset name separately and show it as a subtitle.
+        self._instrument_names[channel] = preset_name
+        plugin = InstrumentPlugin(
+            name=preset_name, sf2_path=sf2,
+            bank=bank, preset=preset, channel=channel,
+        )
+        self._engine.register_instrument(plugin)
+        strip = self._mixer_strips.get(channel)
+        if strip:
+            strip.set_instrument_name(preset_name)
+        if channel == self._selected_channel:
+            self._piano_roll_title.setText(f"PIANO ROLL  —  {track.name}")
+        self._st_engine.setText(
+            f"Instrument changed → '{preset_name}'  (CH {channel + 1})")
+
+    # ── Audio drop from arrangement view ──────────────────────────────────
+
+    @Slot(float)
+    def _on_arrange_audio_drop(self, beat: float) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Add Audio Sample", os.path.expanduser("~"),
+            "Audio Files (*.wav *.mp3 *.ogg *.flac *.aiff *.aif);;All Files (*)",
+        )
+        if path:
+            name = os.path.splitext(os.path.basename(path))[0]
+            self._midi.add_audio_track(path, beat, name=name, color=C["gold"])
+            self._refresh_piano_roll()
+
+    # ── Octave changed → navigate piano roll ──────────────────────────────
+
+    @Slot(int)
+    def _on_octave_changed(self, value: int) -> None:
+        self._controller.set_octave(value)
+        self._piano_roll.jump_to_pitch(self._nav_pitch())
+
+    def _nav_pitch(self) -> int:
+        """Compute navigation pitch from Root combo + Octave spinbox."""
+        rt = self._transport.root_combo.currentText()
+        NOTES = ["C", "C#", "D", "D#", "E", "F",
+                 "F#", "G", "G#", "A", "A#", "B"]
+        base = NOTES.index(rt[:-1]) + (int(rt[-1]) + 1) * 12
+        return max(0, min(127, base + self._transport.octave_spin.value() * 12))
+
+    @Slot(int)
+    def _on_remove_track(self, channel: int) -> None:
+        if QMessageBox.question(
+            self, "Remove Track",
+            f"Remove channel {channel+1}? All notes will be lost.",
+            QMessageBox.Yes | QMessageBox.No,
+        ) == QMessageBox.Yes:
+            self._remove_track(channel)
+
+    @Slot()
+    def _on_add_track(self) -> None:
+        dlg = AddTrackDialog(self._engine, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        # VST path takes priority; SF2 path is the default
+        vst = dlg.result_vst_track()
+        if vst:
+            self._on_add_vst_track(vst)
+            return
+        track, plugin = dlg.result_track(), dlg.result_plugin()
+        if track and plugin:
+            self.add_track(track, plugin)
+            self._st_engine.setText(f"Engine: Track '{track.name}' added")
+
+    # ── Piano roll draw/select mode ───────────────────────────────────────────
+
+    @Slot(bool)
+    def _on_draw_mode_toggled(self, checked: bool) -> None:
+        if checked:
+            self._draw_mode_btn.setText("✏ DRAW")
+            self._piano_roll.set_edit_mode("draw")
+        else:
+            self._draw_mode_btn.setText("⊡ SELECT")
+            self._piano_roll.set_edit_mode("select")
+
+    # ── Seek (ruler click) ────────────────────────────────────────────────────
+
+    @Slot(float)
+    def _on_seek(self, beat: float) -> None:
+        if self._midi.is_playing:
+            self._midi.stop()
+            self._midi.play(from_beat=beat)
+            self._st_engine.setText("Engine: ▶ PLAYING")
+        else:
+            self._midi._playhead_beat = beat
+            self._arrange_view.update()
+            self._piano_roll.update()
+
+    # ── Arrangement horizontal scrollbar ─────────────────────────────────────
+
+    @Slot(float)
+    def _on_arrange_scroll_x(self, view_x: float) -> None:
+        self._arrange_hscroll.blockSignals(True)
+        self._arrange_hscroll.setValue(int(view_x * 4))
+        self._arrange_hscroll.blockSignals(False)
+
+    @Slot(int)
+    def _on_arrange_hscroll(self, value: int) -> None:
+        self._arrange_view.set_view_x(value / 4.0)
+
+    # ── Piano roll vertical scrollbar ─────────────────────────────────────────
+
+    @Slot(int)
+    def _on_piano_vscroll(self, value: int) -> None:
+        """
+        Sync the piano roll view offset when the user drags the scrollbar thumb.
+
+        _view_y is set directly so the rendering stays in step with the thumb
+        position without the piano roll emitting view_y_changed back (which
+        would cause a redundant setValue call, but no infinite loop).
+        """
+        self._piano_roll._view_y = value
+        self._piano_roll.update()
+
+    # ── Audio clip toolbar button ──────────────────────────────────────────────
+
+    @Slot()
+    def _on_add_audio_clip_toolbar(self) -> None:
+        """Open a file dialog and add an audio sample as its own track."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Add Audio Sample", os.path.expanduser("~"),
+            "Audio Files (*.wav *.mp3 *.ogg *.flac *.aiff *.aif);;All Files (*)",
+        )
+        if not path:
+            return
+        beat = max(0.0, self._arrange_view._view_x)
+        name = os.path.splitext(os.path.basename(path))[0]
+        self._midi.add_audio_track(path, beat, name=name, color=C["gold"])
+        self._refresh_piano_roll()
+        self._view_stack.setCurrentIndex(0)
+
+    # ── VST track ─────────────────────────────────────────────────────────────
+
+    def _on_add_vst_track(self, vst_track: VstTrack) -> None:
+        """
+        Load a VST plugin, create a matching MIDI track for note storage,
+        and add a mixer strip — mirrors add_track() for SF2 instruments.
+        """
+        ok = self._vst_manager.add_track(vst_track)
+        if not ok:
+            QMessageBox.warning(
+                self, "VST Load Failed",
+                f"Could not load plugin:\n{vst_track.plugin_path}\n\n"
+                "Make sure pedalboard is installed:\n"
+                "  pip install pedalboard sounddevice",
+            )
+            return
+
+        # Create a companion MidiTrack so the piano roll can store notes
+        midi_track = MidiTrack(
+            name=vst_track.name,
+            channel=vst_track.channel,
+            color=vst_track.color,
+        )
+        self._midi.add_track(midi_track)
+        self._effect_chains[vst_track.channel] = EffectChain(
+            channel=vst_track.channel)
+
+        strip = MixerStrip(vst_track.channel, vst_track.name, vst_track.color)
+        strip.gain_changed  .connect(self._engine.set_gain)
+        strip.pan_changed   .connect(self._engine.set_pan)
+        strip.mute_toggled  .connect(self._engine.set_mute)
+        strip.solo_toggled  .connect(self._engine.set_solo)
+        strip.track_selected.connect(self._on_track_selected)
+        strip.remove_clicked.connect(self._on_remove_track)
+        self._instrument_names[vst_track.channel] = vst_track.name
+        strip.set_instrument_name(vst_track.name)
+        self._mixer_strips[vst_track.channel] = strip
+        self._mixer_layout.addWidget(strip)
+
+        # Always activate the newly loaded VST track.
+        self._active_clip = None
+        self._piano_roll.set_active_clip(None)
+        self._on_track_selected(vst_track.channel)
+
+        self._refresh_piano_roll()
+        self._st_engine.setText(
+            f"Engine: VST Track '{vst_track.name}' loaded  (CH {vst_track.channel + 1})")
+
+        # Start real-time audio stream and route note events through the VST.
+        ok = self._vst_manager.start_realtime(vst_track.channel)
+        if ok:
+            vst_player = self._vst_manager._rt_players.get(vst_track.channel)
+            if vst_player:
+                self._engine.register_vst_player(vst_track.channel, vst_player)
+        else:
+            QMessageBox.warning(
+                self, "VST Audio Unavailable",
+                f"Real-time audio for '{vst_track.name}' could not start.\n\n"
+                "Make sure these packages are installed:\n"
+                "  pip install sounddevice numpy\n\n"
+                "The track will be created but will produce no sound until "
+                "you restart the app after installing the packages.",
+            )
+
+        # Auto-open the parameter panel so the user can tweak the VST immediately
+        QTimer.singleShot(100, lambda: self._open_vst_panel(vst_track.channel))
+
+    def _open_vst_panel(self, channel: int) -> None:
+        """Open the VST parameter panel for a channel (delayed call safe)."""
+        dlg = VstParameterPanel(self._vst_manager, channel, self._controller, self)
+        dlg.exec()
+
+    @Slot()
+    def _on_open_vst_editor(self) -> None:
+        """
+        Open the VST parameter panel for the currently selected track.
+
+        If pedalboard is not installed, a helpful install hint is shown.
+        If the track is not a VST track, the user is informed.
+        """
+        if not self._vst_manager.is_available():
+            QMessageBox.information(
+                self, "VST Not Available",
+                "pedalboard is not installed.\n\n"
+                "Install it with:\n  pip install pedalboard sounddevice",
+            )
+            return
+        vst_track = self._vst_manager.get_track(self._selected_channel)
+        if not vst_track:
+            QMessageBox.information(
+                self, "Not a VST Track",
+                "The selected track is an SF2 instrument, not a VST plugin.")
+            return
+        dlg = VstParameterPanel(self._vst_manager, self._selected_channel,
+                                self._controller, self)
+        dlg.exec()
+
+    @Slot()
+    def _on_new_project(self) -> None:
+        """Clear all tracks and start fresh without restarting the app."""
+        if QMessageBox.question(
+            self, "✦  New Project",
+            "This will erase all tracks and notes. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+
+        self._midi.stop()
+        self._engine.all_notes_off()
+
+        for strip in list(self._mixer_strips.values()):
+            self._mixer_layout.removeWidget(strip)
+            strip.deleteLater()
+        self._mixer_strips.clear()
+
+        for ch in list(self._engine._instruments.keys()):
+            self._engine.unregister_instrument(ch)
+
+        for ch in list(self._vst_manager._tracks.keys()):
+            self._vst_manager.remove_track(ch)
+
+        self._midi._tracks.clear()
+        self._midi.clear_clips()
+        self._effect_chains.clear()
+        self._pygame_sounds.clear()
+        self._selected_channel = 0
+        self._active_clip = None
+        self._piano_roll.set_active_clip(None)
+        self._transport.bpm_spin.setValue(120)
+        self._transport.loop_btn.setChecked(False)
+        self._clip_lane.set_clips([])
+        self._arrange_view.set_audio_tracks([])
+        self._view_stack.setCurrentIndex(0)
+        self._refresh_piano_roll()
+        self._st_engine.setText("Engine: ■ New Project")
+
+    @Slot()
+    def _on_save_midi(self) -> None:
+        if not self._midi.get_all_tracks():
+            QMessageBox.information(self, "Save MIDI",
+                "No tracks to save. Add tracks and draw notes first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save MIDI File",
+            os.path.expanduser("~/Untitled.mid"),
+            "MIDI Files (*.mid);;All Files (*)",
+        )
+        if not path:
+            return
+        ok = self._midi.export_to_midi_file(path)
+        if ok:
+            QMessageBox.information(self, "Save MIDI", f"Saved:\n{path}")
+        else:
+            QMessageBox.critical(self, "Save MIDI", "Export failed.")
+
+    @Slot()
+    def _on_open_midi(self) -> None:
+        if self._midi.get_all_tracks():
+            if QMessageBox.question(
+                self, "Open MIDI",
+                "Opening will replace all current tracks. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open MIDI File", os.path.expanduser("~"),
+            "MIDI Files (*.mid *.midi);;All Files (*)",
+        )
+        if not path:
+            return
+
+        self._midi.stop()
+        self._engine.all_notes_off()
+        for strip in list(self._mixer_strips.values()):
+            self._mixer_layout.removeWidget(strip)
+            strip.deleteLater()
+        self._mixer_strips.clear()
+        for ch in list(self._engine._instruments.keys()):
+            self._engine.unregister_instrument(ch)
+        self._effect_chains.clear()
+
+        ok = self._midi.import_from_midi_file(path)
+        if not ok:
+            QMessageBox.critical(self, "Open MIDI", "Import failed.")
+            return
+
+        self._transport.bpm_spin.setValue(self._midi.bpm)
+        sf2_files = AudioEngine.get_available_sf2_files()
+        sf2 = sf2_files[0] if sf2_files else ""
+
+        for track in self._midi.get_all_tracks():
+            track.color = C["tracks"][track.channel % len(C["tracks"])]
+            is_drums = (track.channel == 9)
+            plugin = InstrumentPlugin(
+                name=track.name, sf2_path=sf2,
+                bank=128 if is_drums else 0, preset=0,
+                channel=track.channel,
+            )
+            if sf2:
+                self._engine.register_instrument(plugin)
+
+            self._effect_chains[track.channel] = EffectChain(
+                channel=track.channel)
+
+            strip = MixerStrip(track.channel, track.name, track.color)
+            strip.gain_changed  .connect(self._engine.set_gain)
+            strip.pan_changed   .connect(self._engine.set_pan)
+            strip.mute_toggled  .connect(self._engine.set_mute)
+            strip.solo_toggled  .connect(self._engine.set_solo)
+            strip.track_selected.connect(self._on_track_selected)
+            strip.remove_clicked.connect(self._on_remove_track)
+            self._mixer_strips[track.channel] = strip
+            self._mixer_layout.addWidget(strip)
+
+        if self._midi.get_all_tracks():
+            self._on_track_selected(self._midi.get_all_tracks()[0].channel)
+
+        # Apply all effect chains now — this zeros reverb/chorus so the
+        # imported MIDI doesn't play with FluidSynth's default heavy reverb.
+        for ch, chain in self._effect_chains.items():
+            self._engine.apply_effect_chain(chain)
+
+        self._refresh_piano_roll()
+        self._st_engine.setText(f"Opened: {os.path.basename(path)}")
+
+    @Slot()
+    def _on_export(self) -> None:
+        import subprocess, tempfile
+
+        if not self._midi.get_all_tracks():
+            QMessageBox.information(self, "Export", "Add tracks first.")
+            return
+
+        dlg = ExportDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        out_path = dlg.result_path().strip()
+        fmt = dlg.result_format()
+        base = os.path.splitext(out_path)[0]
+
+        sf2_files = AudioEngine.get_available_sf2_files()
+        if not sf2_files:
+            QMessageBox.critical(self, "Export", "No SoundFont found — cannot render audio.")
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as f:
+            tmp_midi = f.name
+
+        try:
+            instruments = {p.channel: (p.bank, p.preset) for p in self._engine.get_instruments()}
+            self._midi.export_to_midi_file(tmp_midi, instruments=instruments)
+
+            # For AAC we render to a temp WAV first, then encode.
+            wav_path = base + ".wav" if fmt == "wav" else base + "_tmp_export.wav"
+            ok = self._engine.export_to_wav(wav_path, tmp_midi, sf2_files[0])
+        finally:
+            os.unlink(tmp_midi)
+
+        if not ok:
+            QMessageBox.critical(self, "Export", "WAV render failed — check the log for details.")
+            return
+
+        if fmt == "mp3":
+            out = base + ".mp3"
+            ffmpeg = next(
+                (p for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg",
+                              __import__("shutil").which("ffmpeg")]
+                 if p and os.path.isfile(p)), None
+            )
+            if not ffmpeg:
+                QMessageBox.critical(self, "Export",
+                    "ffmpeg not found.\n\nInstall it with:\n"
+                    "  /opt/homebrew/bin/brew install ffmpeg")
+                return
+            try:
+                subprocess.run(
+                    [ffmpeg, "-y", "-i", wav_path, "-b:a", "192k", out],
+                    check=True, capture_output=True,
+                )
+                os.unlink(wav_path)
+                QMessageBox.information(self, "Export", f"Saved: {out}")
+            except subprocess.CalledProcessError as exc:
+                err = exc.stderr.decode(errors="replace") if exc.stderr else "(no output)"
+                QMessageBox.critical(self, "Export", f"ffmpeg failed:\n{err}")
+        elif fmt == "aac":
+            out = base + ".m4a"
+            try:
+                # afconvert ships with every macOS install — no external tools needed.
+                subprocess.run(
+                    ["afconvert", "-f", "m4af", "-d", "aac", "-b", "192000",
+                     wav_path, out],
+                    check=True, capture_output=True,
+                )
+                os.unlink(wav_path)
+                QMessageBox.information(self, "Export", f"Saved: {out}")
+            except subprocess.CalledProcessError as exc:
+                err = exc.stderr.decode(errors="replace") if exc.stderr else "(no output)"
+                QMessageBox.critical(self, "Export", f"afconvert failed:\n{err}")
+        else:
+            QMessageBox.information(self, "Export", f"Saved: {wav_path}")
+
+    @Slot()
+    def _on_scale_changed(self) -> None:
+        scale = self._transport.scale_combo.currentText()
+        rt    = self._transport.root_combo.currentText()
+        NOTES = ["C", "C#", "D", "D#", "E", "F",
+                 "F#", "G", "G#", "A", "A#", "B"]
+        pitch = NOTES.index(rt[:-1]) + (int(rt[-1]) + 1) * 12
+        self._controller.set_scale(scale, pitch)
+        self._st_scale.setText(f"Scale: {scale.title()} — {rt}")
+        self._piano_roll.jump_to_pitch(self._nav_pitch())
+
+    @Slot()
+    def _on_connect_gamepad(self) -> None:
+        # Stop any previous timer before re-connecting.
+        if self._gamepad_timer is not None:
+            self._gamepad_timer.stop()
+            self._gamepad_timer = None
+
+        ok = self._controller.start_gamepad_polling()
+        if ok:
+            # Drive poll_once() from the main thread via QTimer so that
+            # pygame.event.pump() never runs on a background thread
+            # (macOS AppKit requires it on the main thread).
+            self._gamepad_timer = QTimer(self)
+            self._gamepad_timer.timeout.connect(self._controller.poll_once)
+            self._gamepad_timer.start(16)   # ~60 Hz
+
+            name = self._controller.controller_name
+            QMessageBox.information(self, "Gamepad",
+                f"{name} connected!\n\n"
+                "8 buttons → scale degrees 0–7\n"
+                "D-pad Up / Down → octave shift")
+        else:
+            QMessageBox.warning(self, "Gamepad",
+                "No gamepad detected.\n\n"
+                "Make sure your PS5 or Switch Pro Controller\n"
+                "is connected via USB or Bluetooth first.")
+
+    @Slot()
+    def _on_show_map(self) -> None:
+        NOTES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+
+        def note_name(pitch: int) -> str:
+            return f"{NOTES[pitch % 12]}{pitch // 12 - 1}"
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Input Mapping Guide")
+        dlg.setMinimumSize(520, 480)
+        dlg.setStyleSheet(STYLESHEET)
+        lay = QVBoxLayout(dlg)
+
+        # Header
+        cname = self._controller.controller_name
+        gamepad_info = f"  ·  Gamepad: {cname}" if cname else "  ·  No gamepad connected"
+        lay.addWidget(_label(
+            f"Scale: {self._controller.scale_name.title()}   "
+            f"Root: {note_name(self._controller.root_pitch)}   "
+            f"Channel {self._controller.active_channel + 1}"
+            f"{gamepad_info}",
+            C["cyan"], 11, True))
+
+        tabs = QTabWidget()
+        tabs.setStyleSheet("QTabWidget::pane { border: none; }")
+
+        # ── Keyboard tab ──────────────────────────────────────────────────
+        kb_w  = QWidget()
+        kb_lay = QVBoxLayout(kb_w)
+        kb_lay.addWidget(_label(
+            "↑ Arrow Up = Octave +1    ↓ Arrow Down = Octave −1",
+            C["gold"], 10, False))
+        kb_grid_w = QWidget()
+        kb_grid   = QGridLayout(kb_grid_w)
+        kb_grid.addWidget(_label("Key",  C["text_dim"]), 0, 0)
+        kb_grid.addWidget(_label("Note", C["text_dim"]), 0, 1)
+        kb_grid.addWidget(_label("MIDI", C["text_dim"]), 0, 2)
+        for row, (_, m) in enumerate(
+            list(self._controller.get_key_map().items())[:36], 1
+        ):
+            kb_grid.addWidget(QLabel(m.label.upper()),          row, 0)
+            kb_grid.addWidget(QLabel(note_name(m.midi_pitch)), row, 1)
+            kb_grid.addWidget(QLabel(str(m.midi_pitch)),        row, 2)
+        sa_kb = QScrollArea()
+        sa_kb.setWidget(kb_grid_w)
+        sa_kb.setWidgetResizable(True)
+        kb_lay.addWidget(sa_kb)
+        tabs.addTab(kb_w, "⌨ Keyboard")
+
+        # ── Gamepad tab ───────────────────────────────────────────────────
+        gp_w  = QWidget()
+        gp_lay = QVBoxLayout(gp_w)
+
+        gp_grid_w = QWidget()
+        gp_grid   = QGridLayout(gp_grid_w)
+        gp_grid.addWidget(_label("Button",  C["text_dim"]), 0, 0)
+        gp_grid.addWidget(_label("Action",  C["text_dim"]), 0, 1)
+        gp_grid.addWidget(_label("Note",    C["text_dim"]), 0, 2)
+
+        row = 1
+        for _, m in self._controller._gamepad_map.items():
+            gp_grid.addWidget(QLabel(m.label),               row, 0)
+            gp_grid.addWidget(QLabel("Play note"),            row, 1)
+            gp_grid.addWidget(QLabel(note_name(m.midi_pitch)), row, 2)
+            row += 1
+        for _, m in self._controller._axis_map.items():
+            gp_grid.addWidget(QLabel(f"{m.label} (trigger)"), row, 0)
+            gp_grid.addWidget(QLabel("Play note"),            row, 1)
+            gp_grid.addWidget(QLabel(note_name(m.midi_pitch)), row, 2)
+            row += 1
+
+        # Fixed entries for D-pad and special actions
+        for btn, action in [("D-pad ↑", "Octave +1"), ("D-pad ↓", "Octave −1")]:
+            gp_grid.addWidget(QLabel(btn),    row, 0)
+            gp_grid.addWidget(QLabel(action), row, 1)
+            gp_grid.addWidget(QLabel("—"),    row, 2)
+            row += 1
+
+        if row == 1:
+            gp_lay.addWidget(_label(
+                "No gamepad connected.\nConnect a PS5 or Switch controller\n"
+                "and click the GAMEPAD button in the toolbar.",
+                C["text_dim"], 10, False))
+        else:
+            sa_gp = QScrollArea()
+            sa_gp.setWidget(gp_grid_w)
+            sa_gp.setWidgetResizable(True)
+            gp_lay.addWidget(sa_gp)
+
+        tabs.addTab(gp_w, "🎮 Gamepad")
+        lay.addWidget(tabs)
+
+        close = QPushButton("Close")
+        close.clicked.connect(dlg.accept)
+        lay.addWidget(close, alignment=Qt.AlignRight)
+        dlg.exec()
+
+    # ── Piano roll copy / paste ───────────────────────────────────────────────
+
+    def _copy_selected_notes(self) -> None:
+        """Copy selected notes to the internal clipboard (relative positions)."""
+        if not self._active_clip:
+            return
+        selected = [n for n in self._active_clip.notes
+                    if n.note_id in self._piano_roll._selected_ids]
+        if not selected:
+            self._st_engine.setText("Copy: no notes selected")
+            return
+        min_beat = min(n.start_beat for n in selected)
+        self._note_clipboard = [
+            {"rel_beat": n.start_beat - min_beat,
+             "pitch":    n.pitch,
+             "duration": n.duration,
+             "velocity": n.velocity}
+            for n in selected
+        ]
+        self._st_engine.setText(f"Copied {len(selected)} note(s) — Cmd+V to paste")
+
+    def _paste_notes(self) -> None:
+        """Paste clipboard notes at the last clicked beat position in the piano roll."""
+        if not self._note_clipboard:
+            self._st_engine.setText("Paste: clipboard is empty — select and Cmd+C first")
+            return
+        if not self._active_clip:
+            self._st_engine.setText("Paste: no active clip — create or open a clip first")
+            return
+        paste_beat = max(0.0, self._piano_roll._last_click_beat)
+        new_ids: set = set()
+        for entry in self._note_clipboard:
+            note = self._midi.add_note_to_clip(
+                self._active_clip,
+                paste_beat + entry["rel_beat"],
+                entry["duration"],
+                entry["pitch"],
+                entry["velocity"],
+                self._selected_channel,
+            )
+            new_ids.add(note.note_id)
+        # Select the pasted notes so the user can immediately move/inspect them
+        self._piano_roll._selected_ids = new_ids
+        self._refresh_piano_roll()
+        self._st_engine.setText(
+            f"Pasted {len(self._note_clipboard)} note(s) at beat {paste_beat:.2f}")
+
+    @Slot()
+    def _on_refresh_tick(self) -> None:
+        if self._midi.is_playing:
+            self._st_beat.setText(f"♩ {self._midi.playhead_beat:.2f}")
+            self._piano_roll.update()
+            self._arrange_view.update()
+
+    def _note_event_callback(self, channel: int, pitch: int, velocity: int, is_on: bool) -> None:
+        # AudioEngine.note_on/off already handles VST routing via _vst_players,
+        # so one unified path works for both VST and FluidSynth channels.
+        if is_on:
+            chain = self._effect_chains.get(channel)
+            self._engine.note_on_with_effects(channel, pitch, velocity, chain)
+        else:
+            self._engine.note_off(channel, pitch)
+
+    # ------------------------------------------------------------------
+    # Qt overrides
+    # ------------------------------------------------------------------
+
+    def keyPressEvent(self, ev: QKeyEvent) -> None:
+        if not ev.isAutoRepeat():
+            key  = ev.key()
+            mods = ev.modifiers()
+            ctrl = bool(mods & Qt.ControlModifier)
+
+            if key == Qt.Key_Up:
+                self._transport.octave_spin.setValue(
+                    self._transport.octave_spin.value() + 1)
+                return
+            if key == Qt.Key_Down:
+                self._transport.octave_spin.setValue(
+                    self._transport.octave_spin.value() - 1)
+                return
+            if ctrl and key == Qt.Key_C:
+                self._copy_selected_notes()
+                return
+            if ctrl and key == Qt.Key_V:
+                self._paste_notes()
+                return
+
+            self._controller.handle_key_press(key)
+        super().keyPressEvent(ev)
+
+    def keyReleaseEvent(self, ev: QKeyEvent) -> None:
+        if not ev.isAutoRepeat():
+            key  = ev.key()
+            mods = ev.modifiers()
+            ctrl = bool(mods & Qt.ControlModifier)
+            if key in (Qt.Key_Up, Qt.Key_Down):
+                return
+            if ctrl and key in (Qt.Key_C, Qt.Key_V):
+                return
+            self._controller.handle_key_release(key)
+        super().keyReleaseEvent(ev)
+
+    def closeEvent(self, ev) -> None:
+        self._refresh_timer.stop()
+        if self._gamepad_timer is not None:
+            self._gamepad_timer.stop()
+        self._midi.stop()
+        self._controller.stop_gamepad_polling()
+        self._engine.stop()
+        ev.accept()
