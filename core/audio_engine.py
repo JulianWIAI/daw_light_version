@@ -21,6 +21,7 @@ import ctypes
 import ctypes.util
 import logging
 import os
+import sys
 import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -317,6 +318,10 @@ class AudioEngine:
         self._next_channel = 0                     # auto-assign channels (0-15)
         self._vst_players: Dict[int, object] = {}  # channel → VstRealTimePlayer
 
+        # Dedicated MIDI channel used exclusively for instrument auditioning.
+        # Never registered in _instruments so it does not appear in the mixer.
+        self._preview_sfid: int = -1               # FluidSynth soundfont id for preview
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -330,11 +335,9 @@ class AudioEngine:
         per sample block — more than enough for real-time MIDI events.
 
         Driver fallback order:
-            coreaudio → macOS native (lowest latency on Mac)
-            pulseaudio → Linux desktop
-            alsa       → Linux server / embedded
-            dsound     → Windows
-            portaudio  → cross-platform fallback
+            Windows: wasapi → dsound → waveout → portaudio
+            macOS:   coreaudio → portaudio
+            Linux:   pulseaudio → alsa → portaudio
 
         Args:
             sample_rate: PCM sample rate passed to FluidSynth (Hz).
@@ -363,8 +366,17 @@ class AudioEngine:
             self._running = False
             return False
 
-        # Try drivers in preference order; stop at the first that works.
-        drivers = ["coreaudio", "pulseaudio", "alsa", "dsound", "portaudio"]
+        # Driver preference order by platform.
+        # pyfluidsynth does not raise on unsupported drivers (FluidSynth prints
+        # a C-level error but returns normally), so we must try the correct
+        # driver for the current OS first to avoid silently getting no audio.
+        if sys.platform == "win32":
+            drivers = ["wasapi", "dsound", "waveout", "portaudio"]
+        elif sys.platform == "darwin":
+            drivers = ["coreaudio", "portaudio"]
+        else:
+            drivers = ["pulseaudio", "alsa", "portaudio"]
+
         for driver in drivers:
             try:
                 self._fs.start(driver=driver)
@@ -734,6 +746,8 @@ class AudioEngine:
             channel: MIDI channel (0–15).
             gain:    Normalised volume (0.0 = silence, 1.0 = full).
         """
+        if channel < 0 or channel > 15:
+            return  # virtual channel (rack row_id) — no FluidSynth mapping
         plugin = self._instruments.get(channel)
         if plugin:
             plugin.gain = max(0.0, min(1.0, gain))
@@ -749,6 +763,8 @@ class AudioEngine:
             channel: MIDI channel (0–15).
             pan:     Position from -1.0 (hard left) to +1.0 (hard right).
         """
+        if channel < 0 or channel > 15:
+            return  # virtual channel (rack row_id) — no FluidSynth mapping
         plugin = self._instruments.get(channel)
         if plugin:
             plugin.pan = max(-1.0, min(1.0, pan))
@@ -820,6 +836,79 @@ class AudioEngine:
     def is_running(self) -> bool:
         """True if the synthesiser is active and ready to accept events."""
         return self._running
+
+    def get_instruments_by_channel(self) -> Dict[int, "InstrumentPlugin"]:
+        """Return a {channel: InstrumentPlugin} snapshot for offline rendering."""
+        return dict(self._instruments)
+
+    # ------------------------------------------------------------------
+    # Instrument preview  (used by selection dialogs for live auditioning)
+    # ------------------------------------------------------------------
+
+    # Channel 15 is reserved for preview; it is never added to _instruments.
+    PREVIEW_CHANNEL: int = 15
+
+    def load_preview_instrument(
+        self, sf2_path: str, bank: int, preset: int
+    ) -> bool:
+        """
+        Temporarily load an SF2 preset on the preview channel (15).
+
+        Called by instrument selection dialogs when the user highlights a
+        preset so they can audition it before committing.  Any previously
+        loaded preview is unloaded first.
+
+        Returns True on success.
+        """
+        if not self._running or self._fs is None:
+            return False
+        if not os.path.isfile(sf2_path):
+            return False
+
+        # Silence and unload any previous preview soundfont.
+        self.unload_preview_instrument()
+
+        try:
+            sfid = self._fs.sfload(sf2_path)
+            if sfid == -1:
+                logger.warning("Preview: could not load SF2 '%s'", sf2_path)
+                return False
+            self._preview_sfid = sfid
+            self._fs.program_select(self.PREVIEW_CHANNEL, sfid, bank, preset)
+            logger.debug("Preview loaded: %s  bank=%d  preset=%d", sf2_path, bank, preset)
+            return True
+        except Exception as exc:
+            logger.warning("load_preview_instrument failed: %s", exc)
+            return False
+
+    def unload_preview_instrument(self) -> None:
+        """
+        Silence the preview channel and unload the preview soundfont.
+
+        Called when an instrument dialog closes (accept or reject) so no
+        phantom notes keep playing.
+        """
+        if self._fs is None:
+            return
+        try:
+            # GM CC 123 = All Notes Off on the preview channel.
+            self._fs.cc(self.PREVIEW_CHANNEL, 123, 0)
+        except Exception:
+            pass
+        if self._preview_sfid != -1:
+            try:
+                self._fs.sfunload(self._preview_sfid)
+            except Exception:
+                pass
+            self._preview_sfid = -1
+
+    def preview_note_on(self, pitch: int, velocity: int = 100) -> None:
+        """Play a note on the preview channel for auditioning."""
+        self.note_on(self.PREVIEW_CHANNEL, pitch, velocity)
+
+    def preview_note_off(self, pitch: int) -> None:
+        """Stop a note on the preview channel."""
+        self.note_off(self.PREVIEW_CHANNEL, pitch)
 
     def __repr__(self) -> str:
         return (

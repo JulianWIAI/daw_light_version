@@ -29,6 +29,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .audio_loop_scheduler_python import get_audio_loop_scheduler
+
 logger = logging.getLogger(__name__)
 
 
@@ -229,7 +231,15 @@ class MidiTrack:
 # ─────────────────────────────────────────────────────────────────────────────
 
 NoteEventCallback = Callable[[int, int, int, bool], None]
-"""Signature: (channel, pitch, velocity, is_note_on) → None."""
+"""Signature: (channel, pitch, velocity, is_note_on) -> None."""
+
+AudioClipCallback = Callable[[int, str, float], None]
+"""Signature: (track_id, path, duration_seconds) -> None.
+
+track_id is the AudioTrack.track_id so the player can look up the correct
+FX chain. Callers that registered via set_audio_callback() must accept this
+updated three-argument signature.
+"""
 
 
 def _probe_audio_duration(path: str) -> float:
@@ -290,6 +300,14 @@ class MidiLogic:
         self._playing       = False
         self._playhead_beat: float = 0.0
 
+        # Wall-clock anchor for smooth playhead interpolation.
+        # Recorded when play() starts (and reset on each loop iteration restart).
+        # The playhead_beat property computes current beat = _play_start_beat +
+        # elapsed / seconds_per_beat so the GUI line moves continuously even
+        # through silence gaps and audio-only sections where no MIDI events fire.
+        self._play_start_wall: float = 0.0   # time.perf_counter() at anchor
+        self._play_start_beat: float = 0.0   # beat position at anchor
+
         # Recording state
         self._recording         = False
         self._record_start_time: float = 0.0
@@ -300,15 +318,27 @@ class MidiLogic:
         # Monotonically-increasing id counter for notes, clips, and audio tracks
         self._id_counter: int = 1
 
-        # Audio clip scheduling
-        self._audio_callback:    Optional[Callable[[str], None]] = None
-        self._pending_timers:    List[threading.Timer] = []
+        # Audio clip scheduling — callback receives
+        # (track_id, path, duration_secs, start_offset_secs=0.0).
+        self._audio_callback:      Optional[Callable] = None
+        self._stop_audio_callback: Optional[Callable] = None
+        self._pending_timers:      List[threading.Timer] = []
         self._audio_track_counter: int = 0
+
+        # Step sequencer rows (ChannelStepData objects from channel_rack.py).
+        # Stored here as a plain list so MidiLogic never imports Qt-dependent code.
+        # MidiLogic accesses the rows duck-typed via .steps/.channel/.note/.velocity.
+        self._step_rows: list = []
 
         # Loop region
         self._loop_enabled: bool  = False
         self._loop_start:   float = 0.0
         self._loop_end:     float = 8.0
+
+        # Optional C++ bridge — when attached, play() delegates to it and the
+        # Python _playback_loop thread is NOT started.  All transport queries
+        # (playhead_beat, is_playing) read from the C++ engine instead.
+        self._bridge = None   # TimelineEngineBridge | None
 
     def _next_id(self) -> int:
         """Return a unique id and advance the counter."""
@@ -316,7 +346,36 @@ class MidiLogic:
         self._id_counter += 1
         return uid
 
+    # ── C++ bridge wiring ─────────────────────────────────────────────────────
+
+    def attach_bridge(self, bridge) -> None:
+        """
+        Wire up a TimelineEngineBridge for hardware-accelerated playback.
+
+        When a bridge is attached:
+        - play() pushes tracks to C++ then starts the C++ transport.
+        - stop() stops the C++ transport and reads the final beat position.
+        - playhead_beat reads from bridge.current_beat() (lock-free atomic).
+        - The Python _playback_loop thread is NOT started.
+
+        Calling with bridge=None detaches the bridge and reverts to the
+        Python sleep-based playback loop.
+        """
+        self._bridge = bridge
+
     # ── Track management ──────────────────────────────────────────────────────
+
+    def clear_project(self) -> None:
+        """
+        Remove all MIDI tracks, audio tracks, and clips from the project.
+
+        Called by ImportManager when importing a MIDI file in replace mode.
+        Playback must be stopped before calling this.
+        """
+        self._tracks.clear()
+        self._audio_tracks.clear()
+        self._id_counter = 1
+        self._playhead_beat = 0.0
 
     def add_track(self, track: MidiTrack) -> None:
         """Register a MidiTrack.  Channel must be unique."""
@@ -773,8 +832,32 @@ class MidiLogic:
     def clear_clips(self) -> None:
         self._audio_tracks.clear()
 
-    def set_audio_callback(self, callback: Callable[[str, float], None]) -> None:
+    def set_audio_callback(self, callback) -> None:
+        """
+        Register the callback that the playback thread fires for each audio clip.
+
+        Args:
+            callback: Callable with signature
+                        (track_id: int, path: str,
+                         duration_seconds: float,
+                         start_offset_secs: float = 0.0) -> None.
+                      The 4th argument is non-zero when the user seeked into
+                      a clip that started before the playback position.
+        """
         self._audio_callback = callback
+
+    def set_stop_audio_callback(self, callback: Callable) -> None:
+        """
+        Register the callback that stops all currently-playing audio clips.
+
+        The AudioLoopScheduler calls this at every loop boundary (before
+        firing clips for the next iteration) so old audio never overlaps
+        the beginning of the new loop iteration.
+
+        Args:
+            callback: Callable with no arguments, e.g. audio_player.stop_all.
+        """
+        self._stop_audio_callback = callback
 
     # ── Loop region ───────────────────────────────────────────────────────────
 
@@ -782,6 +865,8 @@ class MidiLogic:
         self._loop_enabled = enabled
         self._loop_start   = max(0.0, start)
         self._loop_end     = max(self._loop_start + 0.25, end)
+        if self._bridge is not None and self._bridge.is_available:
+            self._bridge.set_loop(enabled, self._loop_start, self._loop_end)
 
     # ── Live recording ────────────────────────────────────────────────────────
 
@@ -877,34 +962,64 @@ class MidiLogic:
             self._record_clip.add_note(note)
 
     def _elapsed_beats(self) -> float:
-        # If project is playing, use playhead. If stopped, use time since record hit.
+        # Use the wall-clock property during playback for accuracy; fall back to
+        # a separate timer when recording in a stopped state.
         if self._playing:
-            return self._playhead_beat
+            return self.playhead_beat   # wall-clock interpolated position
         return (time.perf_counter() - self._record_start_time) / self.seconds_per_beat
 
     # ── Playback ──────────────────────────────────────────────────────────────
 
     def play(self, from_beat: float = 0.0) -> None:
-        """Start playback from *from_beat* in a background thread."""
+        """
+        Start playback from *from_beat*.
+
+        When a C++ bridge is attached the entire timing chain runs in C++;
+        the Python _playback_loop thread is not started.
+        Without a bridge, falls back to the Python sleep-based loop.
+        """
         if self._playing:
             self.stop()
-        self._playhead_beat = from_beat
-        self._playing       = True
-        self._playback_thread = threading.Thread(
-            target=self._playback_loop,
-            daemon=True,
-            name="SequencerPlayback",
-        )
-        self._playback_thread.start()
-        logger.info("Playback started from beat %.2f", from_beat)
+
+        self._playhead_beat   = from_beat
+        self._play_start_beat = from_beat
+        self._play_start_wall = time.perf_counter()
+        self._playing         = True
+
+        if self._bridge is not None and self._bridge.is_available:
+            # Push all tracks/events to C++ then start the C++ transport.
+            self._bridge.sync_all_tracks(self)
+            self._bridge.play(from_beat)
+            logger.info("Playback started (C++ engine) from beat %.2f", from_beat)
+        else:
+            # Fall back to the Python timer-based playback loop.
+            self._playback_thread = threading.Thread(
+                target=self._playback_loop,
+                daemon=True,
+                name="SequencerPlayback",
+            )
+            self._playback_thread.start()
+            logger.info("Playback started (Python loop) from beat %.2f", from_beat)
 
     def stop(self) -> None:
         """Stop playback, cancel audio timers, and silence all notes."""
+        if self._bridge is not None and self._bridge.is_available and self._playing:
+            # Read the exact C++ playhead position before stopping the transport.
+            self._playhead_beat = self._bridge.current_beat()
+            self._bridge.stop()
+        elif self._playing:
+            # Python loop: capture wall-clock position.
+            elapsed = time.perf_counter() - self._play_start_wall
+            self._playhead_beat = self._play_start_beat + elapsed / self.seconds_per_beat
+
         self._playing = False
         self._cancel_pending_timers()
+
         if self._playback_thread:
             self._playback_thread.join(timeout=1.0)
             self._playback_thread = None
+
+        # Silence all active notes regardless of which engine was driving playback.
         for track in self._tracks.values():
             for pitch in range(128):
                 self._fire_note(track.channel, pitch, 0, False)
@@ -916,6 +1031,20 @@ class MidiLogic:
 
     @property
     def playhead_beat(self) -> float:
+        """
+        Current playhead position in beats.
+
+        With C++ bridge: reads the atomic frame counter lock-free — advances
+        smoothly at 44 100 Hz resolution regardless of MIDI event density.
+        Without bridge: derived from wall-clock elapsed time so the value
+        advances continuously even through silence gaps and audio-only sections.
+        When stopped: returns the position captured at stop() time.
+        """
+        if self._playing:
+            if self._bridge is not None and self._bridge.is_available:
+                return self._bridge.current_beat()
+            elapsed = time.perf_counter() - self._play_start_wall
+            return self._play_start_beat + elapsed / self.seconds_per_beat
         return self._playhead_beat
 
     def _cancel_pending_timers(self) -> None:
@@ -923,22 +1052,20 @@ class MidiLogic:
             t.cancel()
         self._pending_timers.clear()
 
-    def _schedule_audio_clips(
-        self, loop_start: float, iter_start_wall: float, loop_end: float
-    ) -> None:
-        """Fire the audio callback for every clip that falls in [loop_start, loop_end)."""
-        if not self._audio_callback:
-            return
-        for atrack in self._audio_tracks.values():
-            for clip in atrack.clips:
-                if clip.start_beat < loop_start or clip.start_beat >= loop_end:
-                    continue
-                delay = self.beat_to_seconds(clip.start_beat - loop_start)
-                t = threading.Timer(delay, self._audio_callback,
-                                    args=[clip.path, clip.duration_seconds])
-                t.daemon = True
-                t.start()
-                self._pending_timers.append(t)
+    # ── Step sequencer API ────────────────────────────────────────────────────
+
+    def set_step_rows(self, rows: list) -> None:
+        """
+        Set the list of ChannelStepData rows from the Channel Rack.
+        MidiLogic holds a direct reference so edits to the rows are reflected
+        immediately on the next call to _build_flat_events().
+        """
+        self._step_rows = rows
+
+    def get_step_rows(self) -> list:
+        return self._step_rows
+
+    # ── Event building ────────────────────────────────────────────────────────
 
     def _build_flat_events(self) -> List[Tuple]:
         """
@@ -947,44 +1074,140 @@ class MidiLogic:
 
         MidiTrack.notes returns absolute positions, so this method is
         unchanged from the pre-clip architecture.
+        Step sequencer rows are appended after MIDI track events.
         """
         events: List[Tuple] = []
         for track in self._tracks.values():
             for note in track.sorted_notes():
                 events.append(
-                    (note.start_beat, track.channel, note.pitch, note.velocity, True))
+                    (note.start_beat, note.channel, note.pitch, note.velocity, True))
                 events.append(
-                    (note.start_beat + note.duration, track.channel, note.pitch, 0, False))
+                    (note.start_beat + note.duration, note.channel, note.pitch, 0, False))
         events.sort(key=lambda e: e[0])
+
+        # Append step sequencer events covering the project duration
+        if self._step_rows:
+            # Determine project length from MIDI notes + audio clips
+            end = events[-1][0] if events else 0.0
+            for atrack in self._audio_tracks.values():
+                for clip in atrack.clips:
+                    clip_end = (clip.start_beat
+                                + clip.duration_seconds * self._bpm / 60.0)
+                    end = max(end, clip_end)
+            end = max(end + 1.0, 8.0)   # At minimum two bars, with a one-bar tail
+
+            step_events = self._build_step_events(0.0, end)
+            if step_events:
+                events.extend(step_events)
+                events.sort(key=lambda e: e[0])
+
+        return events
+
+    def _build_step_events(self, start: float, end: float) -> List[Tuple]:
+        """
+        Generate note-on / note-off tuples for all active step sequencer rows
+        within the beat range [start, end).
+
+        Each active step fires a 16th note (0.25 beats).  The pattern repeats
+        every 4 beats (one bar of 16 steps).  Note-off fires at 80 % of the
+        step duration so adjacent active steps don't merge into a sustained note.
+        """
+        events: List[Tuple] = []
+        STEP_DUR = 0.25         # One 16th note in beats
+        PAT_LEN  = 4.0          # One bar = 16 × 0.25 beats
+
+        for row in self._step_rows:
+            if not getattr(row, "enabled", True):
+                continue
+            if getattr(row, 'on_timeline', False):
+                continue
+            channel  = getattr(row, "channel",  0)
+            note     = getattr(row, "note",     60)
+            velocity = getattr(row, "velocity", 100)
+            steps    = getattr(row, "steps",    [])
+
+            for i, active in enumerate(steps[:16]):
+                if not active:
+                    continue
+                step_offset = i * STEP_DUR
+                # Find the first repetition at or after start
+                k = max(0, int((start - step_offset) / PAT_LEN))
+                while True:
+                    beat_on = step_offset + k * PAT_LEN
+                    k += 1
+                    if beat_on >= end:
+                        break
+                    if beat_on >= start:
+                        events.append((beat_on, channel, note, velocity, True))
+                        events.append((beat_on + STEP_DUR * 0.8,
+                                       channel, note, 0, False))
         return events
 
     def _playback_loop(self) -> None:
         """
-        Background thread: fires note events and audio clips in precise time.
+        Background thread: fires MIDI note events with wall-clock precision.
 
-        Normal mode: plays once from the current beat to the last event.
-        Loop mode:   repeats the defined region until stop() is called.
+        Audio clips are delegated entirely to AudioLoopScheduler which uses
+        steady_clock + sleep_until for sub-millisecond loop boundary accuracy.
+        This eliminates the ~15 ms Windows sleep imprecision that caused audio
+        clips to be cut off before the loop point.
+
+        Normal mode: plays once; audio scheduler also plays once then stops.
+        Loop mode:   MIDI loop restarts manually; audio scheduler loops
+                     automatically, calling stop_audio_callback at each
+                     boundary before firing new clips.
         """
-        play_from = self._playhead_beat
+        play_from  = self._playhead_beat
+        has_audio  = any(at.clips for at in self._audio_tracks.values())
+
+        # ── Determine loop boundaries ─────────────────────────────────────────
+        # (computed once; loop_start/loop_end may update on each MIDI iteration)
+        if self._loop_enabled:
+            loop_start = self._loop_start
+            loop_end   = self._loop_end
+        else:
+            all_events_probe = self._build_flat_events()
+            loop_start       = play_from
+            secs_per_b       = self.seconds_per_beat
+            midi_end         = (all_events_probe[-1][0] + 0.25
+                                if all_events_probe else play_from)
+            audio_end        = max(
+                (clip.start_beat + clip.duration_seconds / secs_per_b
+                 for at in self._audio_tracks.values()
+                 for clip in at.clips
+                 if clip.duration_seconds > 0),
+                default=play_from,
+            )
+            loop_end = max(midi_end, audio_end, play_from + 0.1)
+
+        # ── Set up the AudioLoopScheduler for audio clips ─────────────────────
+        sched = None
+        if has_audio and self._audio_callback:
+            sched = get_audio_loop_scheduler()
+            sched.set_bpm(self._bpm)
+            sched.set_clip_fn(self._audio_callback)
+            if self._stop_audio_callback:
+                sched.set_stop_fn(self._stop_audio_callback)
+            sched.set_loop(self._loop_enabled, loop_start, loop_end)
+            for atrack in self._audio_tracks.values():
+                for clip in atrack.clips:
+                    sched.add_clip(
+                        atrack.track_id, clip.path,
+                        clip.start_beat, clip.duration_seconds,
+                    )
+            # Start from play_from; in loop mode the scheduler loops forever
+            # until sched.stop() is called.
+            sched.play(play_from)
+
+        iter_start_wall = time.perf_counter()
 
         while self._playing:
             all_events = self._build_flat_events()
-            has_audio  = any(at.clips for at in self._audio_tracks.values())
 
             if not all_events and not has_audio and not self._loop_enabled:
                 break
 
-            if self._loop_enabled:
-                loop_start = self._loop_start
-                loop_end   = self._loop_end
-            else:
-                loop_start = play_from
-                loop_end   = (all_events[-1][0] + 0.25
-                              if all_events else play_from + 4.0)
-
-            iter_start_wall = time.perf_counter()
-            self._schedule_audio_clips(loop_start, iter_start_wall, loop_end)
-
+            # ── Fire MIDI events ──────────────────────────────────────────────
             for beat, channel, pitch, velocity, is_on in all_events:
                 if not self._playing:
                     break
@@ -993,7 +1216,8 @@ class MidiLogic:
                 if beat >= loop_end:
                     break
 
-                target_wall = iter_start_wall + self.beat_to_seconds(beat - loop_start)
+                target_wall = iter_start_wall + self.beat_to_seconds(
+                    beat - loop_start)
                 sleep_time  = target_wall - time.perf_counter()
                 if sleep_time > 0:
                     time.sleep(sleep_time)
@@ -1006,10 +1230,22 @@ class MidiLogic:
 
             if not self._playing:
                 break
+
             if not self._loop_enabled:
+                # Non-loop: keep the thread alive until all audio has finished.
+                # The scheduler already handles precise audio timing; we just
+                # need to keep _playing=True so the playhead line advances.
+                loop_end_wall = (iter_start_wall
+                                 + self.beat_to_seconds(loop_end - loop_start))
+                while self._playing and time.perf_counter() < loop_end_wall:
+                    time.sleep(0.02)
+                if self._playing:
+                    self._playhead_beat = loop_end
                 break
 
-            # Wait until the exact loop boundary, then restart.
+            # ── Loop mode: wait for the MIDI iteration boundary ───────────────
+            # The AudioLoopScheduler handles audio stop + restart precisely at
+            # its own boundary (which is the same wall-clock target).
             loop_end_wall = (iter_start_wall
                              + self.beat_to_seconds(loop_end - loop_start))
             wait = loop_end_wall - time.perf_counter()
@@ -1019,7 +1255,7 @@ class MidiLogic:
             if not self._playing:
                 break
 
-            # Silence all notes before looping to prevent stuck notes.
+            # Silence all MIDI notes to prevent stuck notes on loop restart.
             seen: set = set()
             for track in self._tracks.values():
                 for note in track.notes:
@@ -1028,9 +1264,20 @@ class MidiLogic:
                         seen.add(key)
                         self._fire_note(track.channel, note.pitch, 0, False)
 
-            self._cancel_pending_timers()
-            self._playhead_beat = loop_start
-            play_from           = loop_start
+            # Refresh loop region in case it was changed while playing.
+            loop_start = self._loop_start
+            loop_end   = self._loop_end
+
+            # Reset the wall-clock anchor for the next MIDI iteration.
+            self._playhead_beat   = loop_start
+            self._play_start_beat = loop_start
+            self._play_start_wall = time.perf_counter()
+            iter_start_wall       = time.perf_counter()
+            play_from             = loop_start
+
+        # Stop the audio scheduler when playback ends.
+        if sched is not None:
+            sched.stop()
 
         self._playing = False
         logger.info("Playback loop finished.")

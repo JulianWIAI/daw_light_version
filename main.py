@@ -14,6 +14,15 @@ import logging
 import os
 import sys
 
+# Add the compiled C++ extension directory to sys.path so that
+# "import daw_processors" resolves to the .pyd/.so built in-place.
+# This must happen before any core module is imported because
+# TimelineEngineBridge (imported transitively) tries to import
+# daw_processors at construction time.
+_CPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpp_processors")
+if _CPP_DIR not in sys.path:
+    sys.path.insert(0, _CPP_DIR)
+
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon

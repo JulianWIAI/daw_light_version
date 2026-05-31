@@ -23,15 +23,15 @@ from __future__ import annotations
 
 import logging
 import os
-import struct
 import tempfile
-import wave
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, Signal, Slot
+import numpy as np
+
+from PySide6.QtCore import Qt, QPoint, QRectF, QPointF, QTimer, Signal, Slot
 from PySide6.QtGui import (
     QColor, QPainter, QPen, QBrush, QFont, QKeyEvent,
-    QLinearGradient, QRadialGradient, QPainterPath,
+    QLinearGradient, QRadialGradient, QPainterPath, QPolygonF,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -51,44 +51,31 @@ from .midi_logic import (
 from .controller import ControllerManager, SCALES
 from .effects import EffectChain
 from .vst_engine import VstManager, VstTrack, scan_vst_paths
+from .audio_fx_chain import AudioFxChain
+from .audio_file_player import AudioFilePlayer
+from .audio_fx_panel import AudioFxPanel
+from .audio_mixer_strip import AudioMixerStrip
+from .import_manager import ImportManager, detect_file_type, AUDIO_EXTENSIONS
+from .instrument_renderer import InstrumentRenderer
+from .project_manager import ProjectManager
+from .export_worker import ExportWorker
+from .automation_lane import AutomationPanel, AutomationEnvelope
+from .channel_rack import ChannelRackWindow, ChannelStepData
+from .instrument_preview import InstrumentPreviewWidget
+from .rack_sampler_engine import RackSamplerEngine
+from .waveform_peaks_python import WaveformPeakGenerator
+from .humanizer_panel import HumanizerPanel
+from .velocity_humanizer_python import get_humanizer
+from .grid_snapper_python import get_grid_snapper, all_grid_labels
+from .grid_settings_panel import GridSettingsPanel
+from .export_dialog import ExportDialog as MasterExportDialog
+from .mastering_export_worker import TrackRenderInfo
+from .project_render_info import AutomationRenderInfo, MidiTrackRenderInfo, FullProjectRenderInfo
+from .master_bus_python import get_master_bus
+from .master_bus_channel import MasterBusChannel
 
 logger = logging.getLogger(__name__)
 
-
-def _generate_waveform_peaks(path: str, n_peaks: int = 200) -> Optional[List[float]]:
-    """Read a WAV file and return normalised peak values (0.0–1.0) for display."""
-    try:
-        with wave.open(path, "rb") as wf:
-            n_ch    = wf.getnchannels()
-            sw      = wf.getsampwidth()
-            n_frames = wf.getnframes()
-            if n_frames == 0 or sw not in (1, 2, 3, 4):
-                return None
-            chunk = max(1, n_frames // n_peaks)
-            fmt   = {1: "B", 2: "h", 4: "i"}.get(sw)
-            if fmt is None:
-                return None
-            scale = {1: 128.0, 2: 32768.0, 4: 2147483648.0}[sw]
-            peaks: List[float] = []
-            for _ in range(n_peaks):
-                raw = wf.readframes(chunk)
-                if not raw:
-                    break
-                n_samples = len(raw) // sw
-                if n_samples == 0:
-                    peaks.append(0.0)
-                    continue
-                try:
-                    samples = struct.unpack_from(f"<{n_samples}{fmt}", raw)
-                    # Mix channels → mono peak
-                    mono = [sum(samples[i:i+n_ch]) / n_ch for i in range(0, n_samples, n_ch)]
-                    peak = max(abs(s) for s in mono) / scale if mono else 0.0
-                    peaks.append(min(1.0, peak))
-                except struct.error:
-                    peaks.append(0.0)
-        return peaks if peaks else None
-    except Exception:
-        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -551,6 +538,12 @@ class EffectsPanel(QWidget):
 
         self._building = False
 
+        # Apply immediately so FluidSynth reflects this chain's settings right
+        # away — otherwise FluidSynth keeps its heavy built-in reverb defaults
+        # until the user moves a slider, making the panel appear non-functional.
+        if self._engine is not None:
+            self._engine.apply_effect_chain(self._chain)
+
     # ------------------------------------------------------------------
 
     def _push(self) -> None:
@@ -690,6 +683,17 @@ class PianoRollWidget(QWidget):
         # Edit mode: "draw" (default) or "select"
         self._edit_mode: str = "draw"
 
+        # Current playhead position in beats — updated from MainWindow refresh tick.
+        self._playhead_beat: float = 0.0
+
+        # Grid snap engine (C++ GridSnapper or Python fallback).
+        # Initialized to 1/16 grid, BarsBeats ruler.
+        self._snapper = get_grid_snapper()
+        self._snapper.set_grid("1/16")
+
+        # Convenience alias used by the legacy drawing code path.
+        self._grid_beats: float = self._snapper.grid_beats()
+
         self.setMinimumSize(640, 400)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
@@ -733,6 +737,11 @@ class PianoRollWidget(QWidget):
 
     def set_total_beats(self, beats: float) -> None:
         self._total_beats = beats
+        self.update()
+
+    def set_playhead_beat(self, beat: float) -> None:
+        """Update the playhead position (in beats) and schedule a repaint."""
+        self._playhead_beat = beat
         self.update()
 
     def set_loop_region(self, enabled: bool, start: float, end: float) -> None:
@@ -792,17 +801,22 @@ class PianoRollWidget(QWidget):
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-        gw = w - self.PIANO_WIDTH
-        gh = h - self.HEADER_HEIGHT
-
-        self._draw_bg(p, w, h)
-        self._draw_piano(p, gh)
-        self._draw_ruler(p, gw)
-        self._draw_grid(p, gw, gh)
-        self._draw_notes(p, gw, gh)
-        self._draw_playhead(p, gw, gh)
+        # Always call p.end() — even if a sub-draw raises — so the backing
+        # store is never left with an active painter, which would make the
+        # widget fail to accept mouse events on the next repaint cycle.
+        try:
+            p.setRenderHint(QPainter.Antialiasing)
+            w, h = self.width(), self.height()
+            gw = w - self.PIANO_WIDTH
+            gh = h - self.HEADER_HEIGHT
+            self._draw_bg(p, w, h)
+            self._draw_piano(p, gh)
+            self._draw_ruler(p, gw)
+            self._draw_grid(p, gw, gh)
+            self._draw_notes(p, gw, gh)
+            self._draw_playhead(p, gw, gh)
+        finally:
+            p.end()
 
     def _draw_bg(self, p: QPainter, w: int, h: int) -> None:
         p.fillRect(0, 0, w, h, QColor(C["void"]))
@@ -862,18 +876,24 @@ class PianoRollWidget(QWidget):
         p.drawLine(0, self.HEADER_HEIGHT - 1, gw, self.HEADER_HEIGHT - 1)
 
         p.setFont(QFont("Arial", 9))
-        beat = 0
-        while beat <= self._total_beats:
-            x = int((beat - self._view_x) * self.BEAT_WIDTH)
+        # Ask the snapper for ruler labels at the correct density and mode.
+        ruler_lbls = self._snapper.ruler_labels(
+            max(0.0, self._view_x - 2.0),
+            self._view_x + gw / self.BEAT_WIDTH + 2.0,
+            float(self.BEAT_WIDTH),
+        )
+        for lbl in ruler_lbls:
+            x = int((lbl.beat - self._view_x) * self.BEAT_WIDTH)
             if 0 <= x <= gw:
-                if beat % 4 == 0:
+                if lbl.is_major:
                     p.setPen(QColor(C["cyan"]))
-                    p.drawText(x + 3, self.HEADER_HEIGHT - 5,
-                               f"BAR {int(beat//4)+1}")
+                    p.drawLine(x, 4, x, self.HEADER_HEIGHT - 1)
+                    p.drawText(x + 3, self.HEADER_HEIGHT - 5, lbl.text)
                 else:
                     p.setPen(QPen(QColor(0, 229, 255, 40), 1))
                     p.drawLine(x, 22, x, self.HEADER_HEIGHT - 1)
-            beat += 1
+                    p.setPen(QColor(C["text_dim"]))
+                    p.drawText(x + 3, self.HEADER_HEIGHT - 5, lbl.text)
 
         # Hint label when no loop is set yet
         if not self._loop_enabled and self._loop_drag_origin is None:
@@ -905,20 +925,25 @@ class PianoRollWidget(QWidget):
                 p.setPen(QPen(QColor(0, 229, 255, 25), 1))
                 p.drawLine(0, y, gw, y)
 
-        # Vertical beat lines — bar lines bright, sub-grid lines faint
-        grid_step = getattr(self, "_grid_beats", 0.25)
-        b = 0.0
-        while b <= self._total_beats + grid_step:
+        # Vertical beat lines — bar lines bright, beat lines medium, sub-grid faint.
+        # Uses the GridSnapper to get exact positions for all grid types
+        # (straight, triplet, dotted, Free), avoiding floating-point drift.
+        bar_beats = float(self._snapper.time_sig())
+        lines = self._snapper.grid_lines(
+            max(0.0, self._view_x - self._grid_beats),
+            self._view_x + gw / self.BEAT_WIDTH + self._grid_beats,
+        )
+        for b in lines:
             x = int((b - self._view_x) * self.BEAT_WIDTH)
             if 0 <= x <= gw:
-                if abs(b % 4) < 0.001 or abs(b % 4 - 4) < 0.001:
-                    p.setPen(QPen(QColor(0, 229, 255, 35), 1))
-                elif abs(b % 1) < 0.001:
-                    p.setPen(QPen(QColor(0, 229, 255, 18), 1))
+                in_bar = b % bar_beats
+                if in_bar < 0.001 or abs(in_bar - bar_beats) < 0.001:
+                    p.setPen(QPen(QColor(0, 229, 255, 35), 1))   # bar line
+                elif abs(in_bar % 1.0) < 0.001:
+                    p.setPen(QPen(QColor(0, 229, 255, 18), 1))   # beat line
                 else:
-                    p.setPen(QPen(QColor(0, 229, 255, 8), 1))
+                    p.setPen(QPen(QColor(0, 229, 255, 8), 1))    # sub-beat line
                 p.drawLine(x, 0, x, gh)
-            b = round(b + grid_step, 6)
 
         p.restore()
 
@@ -1077,8 +1102,49 @@ class PianoRollWidget(QWidget):
         p.restore()
 
     def _draw_playhead(self, p: QPainter, gw: int, gh: int) -> None:
-        """Animated neon line showing current playback position."""
-        pass   # Playhead x is updated from MainWindow._on_refresh_tick
+        """
+        Draw the real-time playhead as a bright neon vertical line.
+
+        The line spans the full note-grid height (below the ruler/header).
+        A small downward-pointing triangle cap sits on the ruler at the top
+        to make the position obvious at a glance.
+
+        Coordinates are in the translated frame set up by paintEvent
+        (origin at (PIANO_WIDTH, 0) for the ruler, shifted again to
+        HEADER_HEIGHT for the grid — see caller).
+        """
+        # Convert beat position to pixel X in the grid coordinate system.
+        # _view_x is the leftmost visible beat; BEAT_WIDTH is pixels/beat.
+        x = int((self._playhead_beat - self._view_x) * self.BEAT_WIDTH)
+
+        # Only draw when the playhead is within the visible area.
+        if x < 0 or x > gw:
+            return
+
+        p.save()
+        p.translate(self.PIANO_WIDTH, 0)
+
+        # ── Neon glow: wide semi-transparent band behind the main line ──
+        glow_pen = QPen(QColor(0, 229, 255, 40), 5)
+        p.setPen(glow_pen)
+        p.drawLine(x, 0, x, self.HEADER_HEIGHT + gh)
+
+        # ── Main 1-px cyan line spanning ruler + note grid ──
+        p.setPen(QPen(QColor(0, 229, 255, 220), 1))
+        p.drawLine(x, 0, x, self.HEADER_HEIGHT + gh)
+
+        # ── Triangle cap on the ruler top edge ──
+        # PySide6 drawPolygon requires a QPolygonF; splatting a plain list raises TypeError.
+        p.setBrush(QColor(0, 229, 255, 200))
+        p.setPen(Qt.NoPen)
+        tri = QPolygonF([
+            QPointF(x - 5, 0.0),
+            QPointF(x + 5, 0.0),
+            QPointF(float(x), 10.0),
+        ])
+        p.drawPolygon(tri)
+
+        p.restore()
 
     # ------------------------------------------------------------------
     # Mouse interaction
@@ -1105,23 +1171,24 @@ class PianoRollWidget(QWidget):
                  - self._view_y)
         return beat, pitch
 
-    # Grid sizes: label → beat duration
-    GRID_SIZES = {
-        "1":    4.0,
-        "1/2":  2.0,
-        "1/4":  1.0,
-        "1/8":  0.5,
-        "1/16": 0.25,
-    }
-
     def set_grid_size(self, label: str) -> None:
-        self._grid_beats = self.GRID_SIZES.get(label, 0.25)
+        """Set the active snap grid by label ('1/16', '1/8T', 'Free', …)."""
+        self._snapper.set_grid(label)
+        self._grid_beats = self._snapper.grid_beats()
+        self.update()
+
+    def set_ruler_mode(self, mode: str) -> None:
+        """Set the ruler display mode ('BarsBeats', 'Time', 'SMPTE')."""
+        self._snapper.set_ruler_mode(mode)
+        self.update()
+
+    def set_ruler_fps(self, fps: float) -> None:
+        """Set SMPTE frame rate for the ruler."""
+        self._snapper.set_fps(fps)
         self.update()
 
     def _snap(self, beat: float) -> float:
-        g = getattr(self, "_grid_beats", 0.25)
-        inv = 1.0 / g
-        return max(0.0, round(beat * inv) / inv)
+        return self._snapper.snap(beat)
 
     def _notes_in_lasso(self) -> set:
         """Return the set of note_ids whose rects overlap the current lasso rect."""
@@ -2251,6 +2318,22 @@ class ChangeInstrumentDialog(QDialog):
         sp.setStretchFactor(1, 1)
         root.addWidget(sp, stretch=1)
 
+        # ── Live preview keyboard ──────────────────────────────────────────
+        prev_lbl = _label(
+            "PREVIEW  ·  click keys or use A–K / W–P on your keyboard",
+            C["text_dim"], 9,
+        )
+        root.addWidget(prev_lbl)
+        self._preview = InstrumentPreviewWidget(self)
+        self._preview.set_note_callbacks(
+            on_note_on  = self._engine.preview_note_on,
+            on_note_off = self._engine.preview_note_off,
+        )
+        root.addWidget(self._preview)
+        # Reload the preview sound whenever SF2 or preset selection changes.
+        self._sf2_combo.currentIndexChanged.connect(self._reload_preview)
+        self._pre_list.currentRowChanged.connect(self._reload_preview)
+
         # Buttons
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -2291,6 +2374,15 @@ class ChangeInstrumentDialog(QDialog):
             self._sf2_combo.insertItem(0, os.path.basename(path), userData=path)
             self._sf2_combo.setCurrentIndex(0)
 
+    def _reload_preview(self) -> None:
+        """Load the currently highlighted preset into the preview channel."""
+        sf2: str = self._sf2_combo.currentData() or ""
+        pre_item = self._pre_list.currentItem()
+        if not sf2 or not os.path.isfile(sf2) or pre_item is None:
+            return
+        preset, bank, _ = pre_item.data(Qt.UserRole)
+        self._engine.load_preview_instrument(sf2, bank, preset)
+
     def _on_ok(self) -> None:
         sf2: str = self._sf2_combo.currentData() or ""
         if not sf2 or not os.path.isfile(sf2):
@@ -2304,7 +2396,34 @@ class ChangeInstrumentDialog(QDialog):
             return
         preset, bank, preset_name = pre_item.data(Qt.UserRole)
         self._result_info = (sf2, bank, preset, preset_name)
+        self._cleanup_preview()
         self.accept()
+
+    def _cleanup_preview(self) -> None:
+        """Silence all preview notes and unload the temporary soundfont."""
+        self._preview.silence_all()
+        self._engine.unload_preview_instrument()
+
+    def done(self, result: int) -> None:
+        """Ensure preview is cleaned up on any close path (accept or reject)."""
+        self._cleanup_preview()
+        super().done(result)
+
+    # Forward dialog-level keyboard events to the preview widget so
+    # note shortcuts work even when the list widget has focus.
+    def keyPressEvent(self, event) -> None:
+        from PySide6.QtWidgets import QLineEdit
+        if not isinstance(self.focusWidget(), QLineEdit):
+            self._preview.keyPressEvent(event)
+        else:
+            super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:
+        from PySide6.QtWidgets import QLineEdit
+        if not isinstance(self.focusWidget(), QLineEdit):
+            self._preview.keyReleaseEvent(event)
+        else:
+            super().keyReleaseEvent(event)
 
     def result_plugin_info(self) -> Optional[tuple]:
         return self._result_info
@@ -2827,6 +2946,21 @@ class AddTrackDialog(QDialog):
         sp.setStretchFactor(1, 1)
         root.addWidget(sp, stretch=1)
 
+        # ── Live preview keyboard ──────────────────────────────────────────
+        prev_lbl = _label(
+            "PREVIEW  ·  click keys or use A–K / W–P on your keyboard",
+            C["text_dim"], 9,
+        )
+        root.addWidget(prev_lbl)
+        self._preview = InstrumentPreviewWidget(self)
+        self._preview.set_note_callbacks(
+            on_note_on  = self._engine.preview_note_on,
+            on_note_off = self._engine.preview_note_off,
+        )
+        root.addWidget(self._preview)
+        # Reload preview whenever SF2 or preset selection changes.
+        self._sf2_combo.currentIndexChanged.connect(self._reload_preview)
+
         # Track name row
         nm_row = QHBoxLayout()
         nm_row.addWidget(_label("TRACK NAME", C["text_dim"], 10))
@@ -2894,6 +3028,43 @@ class AddTrackDialog(QDialog):
         item = self._pre_list.item(row)
         if item:
             self._name_edit.setText(item.data(Qt.UserRole)[2])
+            # Trigger live preview for the newly highlighted preset.
+            self._reload_preview()
+
+    def _reload_preview(self) -> None:
+        """Load the currently highlighted preset into the preview channel."""
+        sf2: str = self._sf2_combo.currentData() or ""
+        pre_item = self._pre_list.currentItem()
+        if not sf2 or not os.path.isfile(sf2) or pre_item is None:
+            return
+        preset, bank, _ = pre_item.data(Qt.UserRole)
+        self._engine.load_preview_instrument(sf2, bank, preset)
+
+    def _cleanup_preview(self) -> None:
+        """Silence all preview notes and release the temporary soundfont."""
+        self._preview.silence_all()
+        self._engine.unload_preview_instrument()
+
+    def done(self, result: int) -> None:
+        """Ensure preview is cleaned up on any close path (accept or reject)."""
+        self._cleanup_preview()
+        super().done(result)
+
+    # Forward dialog-level keyboard events to the preview widget so note
+    # shortcuts work even when a list widget or other control has focus.
+    def keyPressEvent(self, event) -> None:
+        from PySide6.QtWidgets import QLineEdit
+        if not isinstance(self.focusWidget(), QLineEdit):
+            self._preview.keyPressEvent(event)
+        else:
+            super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:
+        from PySide6.QtWidgets import QLineEdit
+        if not isinstance(self.focusWidget(), QLineEdit):
+            self._preview.keyReleaseEvent(event)
+        else:
+            super().keyReleaseEvent(event)
 
     def _browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -2927,6 +3098,7 @@ class AddTrackDialog(QDialog):
         self._result_track  = MidiTrack(name=name, channel=ch, color=col)
         self._result_plugin = InstrumentPlugin(
             name=name, sf2_path=sf2, bank=bank, preset=preset, channel=ch)
+        self._cleanup_preview()
         self.accept()
 
     def _on_load_vst(self) -> None:
@@ -2977,6 +3149,8 @@ class TrackArrangeView(QWidget):
     """
 
     track_selected               = Signal(int)          # channel
+    audio_track_selected         = Signal(int)          # track_id (audio)
+    files_dropped                = Signal(list, float)  # [paths], beat_position
     clip_selected                = Signal(int, int)     # channel, clip_id
     clip_edit_requested          = Signal(int, int)     # channel, clip_id  (simple click, no drag)
     clip_moved                   = Signal(int, int, float)   # channel, clip_id, new_start_beat
@@ -2995,6 +3169,12 @@ class TrackArrangeView(QWidget):
     remove_track_requested       = Signal(int)          # channel
     audio_track_remove_requested = Signal(int)          # track_id
     audio_clip_drop_requested    = Signal(float)        # kept for toolbar-flow compat
+    midi_fx_requested            = Signal(int)          # MIDI channel — open FX panel
+    # Emitted when the user clicks the "AUTO" button in a track header.
+    # Payload: (channel_or_track_id, kind) where kind = "midi" or "audio".
+    automation_toggled           = Signal(int, str)
+    # Emitted whenever the beat-width (zoom) changes so AutomationPanel can sync.
+    zoom_changed                 = Signal(int)          # new beat_width in pixels
 
     TRACK_HEIGHT    : int = 60
     AUDIO_ROW_HEIGHT: int = 52
@@ -3028,8 +3208,9 @@ class TrackArrangeView(QWidget):
         self._ruler_press_beat:   float = 0.0
         self._ruler_loop_origin:  Optional[float] = None  # set when drag starts
 
-        # Waveform peak cache: path → list of normalised peak values
-        self._waveform_cache: Dict[str, Optional[List[float]]] = {}
+        # Waveform peak generator — set by MainWindow via set_waveform_generator().
+        # Handles background loading and caching; None until wired up.
+        self._waveform_gen: Optional[WaveformPeakGenerator] = None
 
         # Clip drag / resize state (shared by MIDI and audio clips)
         self._clip_drag_mode:       str   = "none"   # "move" | "resize" | "none"
@@ -3044,8 +3225,17 @@ class TrackArrangeView(QWidget):
         # Kept for legacy (was _drag_channel)
         self._drag_channel:         int   = -1
 
+        # Current playhead beat — updated from MainWindow._on_refresh_tick.
+        self._playhead_beat: float = 0.0
+
+        # Set of track identifiers (channel for MIDI, track_id for audio) that
+        # currently have an AutomationLane visible.  Used to highlight the
+        # AUTO button and toggle visibility via automation_toggled signal.
+        self._auto_tracks: set = set()
+
         self.setMouseTracking(True)
         self.setStyleSheet(f"background:{C['abyss']};")
+        self.setAcceptDrops(True)   # Enable file drag-drop from OS file manager.
         self._resize_widget()
 
     # ── Public API ─────────────────────────────────────────────────────
@@ -3080,6 +3270,10 @@ class TrackArrangeView(QWidget):
         self._bpm = max(20.0, bpm)
         self.update()
 
+    def set_waveform_generator(self, gen: WaveformPeakGenerator) -> None:
+        """Wire the background peak loader so audio clips display waveforms."""
+        self._waveform_gen = gen
+
     def set_loop_region(self, enabled: bool, start: float, end: float) -> None:
         self._loop_enabled = enabled
         self._loop_start   = max(0.0, start)
@@ -3088,6 +3282,7 @@ class TrackArrangeView(QWidget):
 
     def set_zoom(self, beat_width: int) -> None:
         self.BEAT_WIDTH = max(self.ZOOM_MIN, min(self.ZOOM_MAX, beat_width))
+        self.zoom_changed.emit(self.BEAT_WIDTH)  # Sync automation panel zoom
         self.update()
 
     def zoom_in(self) -> None:
@@ -3103,6 +3298,11 @@ class TrackArrangeView(QWidget):
             if s < self.BEAT_WIDTH:
                 self.set_zoom(s)
                 return
+
+    def set_playhead_beat(self, beat: float) -> None:
+        """Update the playhead position (in beats) and schedule a repaint."""
+        self._playhead_beat = beat
+        self.update()
 
     # ── Internal geometry ──────────────────────────────────────────────
 
@@ -3172,16 +3372,24 @@ class TrackArrangeView(QWidget):
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        w = self.width()
-        p.fillRect(0, 0, w, self.height(), QColor(C["abyss"]))
-        p.setPen(QPen(QColor(0, 229, 255, 30), 1))
-        p.drawLine(self.HEADER_WIDTH, 0, self.HEADER_WIDTH, self.height())
-        self._draw_ruler(p, w)
-        for idx, track in enumerate(self._tracks):
-            self._draw_midi_lane(p, track, self._midi_track_y(idx), w)
-        for idx, atrack in enumerate(self._audio_tracks):
-            self._draw_audio_lane(p, atrack, self._audio_track_y(idx), w)
+        # Wrap everything in try/finally so p.end() is always called.
+        # A painter left active on the backing store silently eats mouse
+        # events on subsequent repaints, making toolbar buttons unresponsive.
+        try:
+            p.setRenderHint(QPainter.Antialiasing)
+            w = self.width()
+            p.fillRect(0, 0, w, self.height(), QColor(C["abyss"]))
+            p.setPen(QPen(QColor(0, 229, 255, 30), 1))
+            p.drawLine(self.HEADER_WIDTH, 0, self.HEADER_WIDTH, self.height())
+            self._draw_ruler(p, w)
+            for idx, track in enumerate(self._tracks):
+                self._draw_midi_lane(p, track, self._midi_track_y(idx), w)
+            for idx, atrack in enumerate(self._audio_tracks):
+                self._draw_audio_lane(p, atrack, self._audio_track_y(idx), w)
+            # Playhead drawn last so it appears on top of all track content.
+            self._draw_playhead(p, w)
+        finally:
+            p.end()
 
     def _draw_ruler(self, p: QPainter, w: int) -> None:
         p.fillRect(0, 0, w, self.RULER_HEIGHT, QColor(C["void"]))
@@ -3241,6 +3449,37 @@ class TrackArrangeView(QWidget):
         hint = (f"{total_notes} notes · {len(track.clips)} clip(s)"
                 if track.clips else "right-click → change instrument")
         p.drawText(10, y + 46, hint)
+
+        # ── AUTO button — toggles automation lane for this track ───────────
+        auto_btn_x = self.HEADER_WIDTH - 68
+        auto_btn_y = y + h - 18
+        auto_btn_w = 28
+        auto_btn_h = 14
+        auto_active = track.channel in self._auto_tracks
+        auto_bg = QColor(0, 229, 255, 80) if auto_active else QColor(0, 80, 100, 120)
+        p.fillRect(auto_btn_x, auto_btn_y, auto_btn_w, auto_btn_h, auto_bg)
+        p.setPen(QColor(0, 229, 255, 220 if auto_active else 140))
+        p.setFont(QFont("Arial", 7, QFont.Bold))
+        p.drawText(auto_btn_x + 2, auto_btn_y + auto_btn_h - 3, "AUTO")
+        p.setPen(QPen(QColor(0, 200, 220, 120), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(auto_btn_x, auto_btn_y, auto_btn_w, auto_btn_h)
+
+        # ── FX button — bottom-right corner of the header ──────────────────
+        # Clicking this opens the AudioFxPanel for this MIDI track so the user
+        # can add C++ insert effects to its audio output.
+        fx_btn_x = self.HEADER_WIDTH - 34
+        fx_btn_y = y + h - 18
+        fx_btn_w = 28
+        fx_btn_h = 14
+        p.fillRect(fx_btn_x, fx_btn_y, fx_btn_w, fx_btn_h,
+                   QColor(0, 140, 160, 160))
+        p.setPen(QColor(0, 229, 255, 220))
+        p.setFont(QFont("Arial", 7, QFont.Bold))
+        p.drawText(fx_btn_x + 2, fx_btn_y + fx_btn_h - 3, "FX")
+        p.setPen(QPen(QColor(0, 200, 220, 120), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(fx_btn_x, fx_btn_y, fx_btn_w, fx_btn_h)
 
         # Timeline background
         p.fillRect(self.HEADER_WIDTH, y, w - self.HEADER_WIDTH, h,
@@ -3339,29 +3578,59 @@ class TrackArrangeView(QWidget):
             p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 140), 1))
             p.drawRoundedRect(QRectF(cx, cy, cw, ch2), 3, 3)
 
-            # ── Waveform peaks ─────────────────────────────────────────
-            if aclip.path not in self._waveform_cache:
-                self._waveform_cache[aclip.path] = _generate_waveform_peaks(aclip.path)
+            # ── Waveform rendering ─────────────────────────────────────
+            # Request peaks from the background generator.  Returns None
+            # while the daemon thread is still loading.
+            peaks = (self._waveform_gen.get_peaks(aclip.path)
+                     if self._waveform_gen is not None else None)
 
-            peaks = self._waveform_cache.get(aclip.path)
-            wave_margin = 4
+            wave_margin = 3
             wave_area_h = ch2 - 2 * wave_margin
             wave_mid    = cy + wave_margin + wave_area_h // 2
-            if peaks:
-                n = len(peaks)
-                bar_w = max(1, cw // n)
-                wc = QColor(color.red(), color.green(), color.blue(), 140)
-                p.setPen(QPen(wc, 1))
-                for i, pk in enumerate(peaks):
-                    bx2 = cx + int(i / n * cw)
-                    if bx2 >= cx + cw - 2:
-                        break
-                    half = max(1, int(pk * wave_area_h // 2))
-                    p.drawLine(bx2, wave_mid - half, bx2, wave_mid + half)
+            r, g, b     = color.red(), color.green(), color.blue()
+
+            if peaks and wave_area_h > 2 and cw > 0:
+                n      = len(peaks)
+                pk_arr = np.asarray(peaks, dtype=np.float32)
+
+                # Only draw the VISIBLE portion of the waveform.
+                # Drawing min(cw, 3000) pixels starting from cx caused a flat
+                # line whenever the user scrolled past that fixed pixel budget.
+                draw_x0 = max(cx, self.HEADER_WIDTH)        # left visible pixel
+                draw_x1 = min(cx + cw, w)                   # right visible pixel
+                if draw_x0 < draw_x1:
+                    # Map the visible pixel range to the corresponding peak slice.
+                    clip_px0    = draw_x0 - cx              # offset within clip
+                    clip_px1    = draw_x1 - cx
+                    pixel_count = min(draw_x1 - draw_x0, 3000)
+                    peak_lo     = int(clip_px0 * n / cw)
+                    peak_hi     = min(int(clip_px1 * n / cw) + 1, n)
+                    indices     = np.clip(
+                        np.linspace(peak_lo, max(peak_lo, peak_hi - 1),
+                                    pixel_count).astype(np.int32),
+                        0, n - 1,
+                    )
+                    pixel_peaks = pk_arr[indices]
+                    halves      = np.maximum(
+                        1, (pixel_peaks * wave_area_h * 0.48).astype(np.int32)
+                    )
+                    from PySide6.QtCore import QLine
+                    lines = [
+                        QLine(draw_x0 + px, wave_mid - int(halves[px]),
+                              draw_x0 + px, wave_mid + int(halves[px]))
+                        for px in range(pixel_count)
+                    ]
+                    p.setPen(QPen(QColor(r, g, b, 195), 1))
+                    p.drawLines(lines)
+
+                # Subtle centre reference line across the full clip width.
+                p.setPen(QPen(QColor(255, 255, 255, 22), 1))
+                p.drawLine(cx, wave_mid, cx + cw - 1, wave_mid)
+
             else:
-                # Fallback: flat mid-line
-                p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 40), 1))
-                p.drawLine(cx + 2, wave_mid, cx + cw - 3, wave_mid)
+                # File is loading or unreadable — draw a dim placeholder line.
+                p.setPen(QPen(QColor(r, g, b, 45), 1))
+                p.drawLine(cx + 2, wave_mid, cx + cw - 2, wave_mid)
 
             # Label + duration hint (drawn on top of waveform)
             p.setPen(color)
@@ -3379,6 +3648,43 @@ class TrackArrangeView(QWidget):
 
         p.setPen(QPen(QColor(0, 229, 255, 18), 1))
         p.drawLine(0, y + h - 1, w, y + h - 1)
+
+    def _draw_playhead(self, p: QPainter, w: int) -> None:
+        """
+        Draw the real-time playhead as a bright neon vertical line across the
+        full height of the arrangement timeline.
+
+        The line is drawn AFTER all track content so it always appears on top.
+        A small downward triangle sits in the ruler to mark the exact beat.
+        Only drawn when the playhead x-position falls within the visible area
+        (i.e. to the right of the track-header column).
+        """
+        x = self._beat_to_x(self._playhead_beat)
+
+        # Skip when outside the visible timeline area.
+        if x < self.HEADER_WIDTH or x > w:
+            return
+
+        h = self.height()
+
+        # ── Glow: wide translucent band to make the line easy to see ──
+        p.setPen(QPen(QColor(0, 229, 255, 35), 5))
+        p.drawLine(x, self.RULER_HEIGHT, x, h)
+
+        # ── Main 1-px cyan line ──
+        p.setPen(QPen(QColor(0, 229, 255, 220), 1))
+        p.drawLine(x, self.RULER_HEIGHT, x, h)
+
+        # ── Triangle cap in the ruler ──
+        # PySide6 drawPolygon requires a QPolygonF; splatting a plain list raises TypeError.
+        p.setBrush(QColor(0, 229, 255, 200))
+        p.setPen(Qt.NoPen)
+        tri = QPolygonF([
+            QPointF(x - 5, 0.0),
+            QPointF(x + 5, 0.0),
+            QPointF(float(x), 11.0),
+        ])
+        p.drawPolygon(tri)
 
     # ── Mouse events ────────────────────────────────────────────────────
 
@@ -3413,8 +3719,31 @@ class TrackArrangeView(QWidget):
                     self.remove_track_requested.emit(track.channel)
                 return
 
-            if mx < self.HEADER_WIDTH:
-                self.track_selected.emit(track.channel)
+            if ev.button() == Qt.LeftButton and mx < self.HEADER_WIDTH:
+                # Check whether the click landed on the FX button.
+                # The button rect mirrors what _draw_midi_lane() paints.
+                h_lane    = self.TRACK_HEIGHT
+                fx_btn_x  = self.HEADER_WIDTH - 34
+                fx_btn_y  = y + h_lane - 18
+                fx_btn_x2 = fx_btn_x + 28
+                fx_btn_y2 = fx_btn_y + 14
+                # Check the AUTO button (to the left of the FX button)
+                auto_btn_x  = self.HEADER_WIDTH - 68
+                auto_btn_x2 = auto_btn_x + 28
+                if fx_btn_x <= mx <= fx_btn_x2 and fx_btn_y <= my <= fx_btn_y2:
+                    # Open the FX rack panel for this MIDI track.
+                    self.midi_fx_requested.emit(track.channel)
+                elif auto_btn_x <= mx <= auto_btn_x2 and fx_btn_y <= my <= fx_btn_y2:
+                    # Toggle the automation lane for this MIDI track.
+                    if track.channel in self._auto_tracks:
+                        self._auto_tracks.discard(track.channel)
+                    else:
+                        self._auto_tracks.add(track.channel)
+                    self.automation_toggled.emit(track.channel, "midi")
+                    self.update()
+                else:
+                    # Normal header click: select track for piano roll.
+                    self.track_selected.emit(track.channel)
                 return
 
             _, clip, _, hit = self._find_clip_at(mx, my)
@@ -3466,7 +3795,12 @@ class TrackArrangeView(QWidget):
             if not (y <= my < y + self.AUDIO_ROW_HEIGHT):
                 continue
 
-            # Right-click track header → remove entire audio track
+            # Left-click on header -> select track (show its FX panel).
+            if ev.button() == Qt.LeftButton and mx < self.HEADER_WIDTH:
+                self.audio_track_selected.emit(atrack.track_id)
+                return
+
+            # Right-click track header -> context menu.
             if ev.button() == Qt.RightButton and mx < self.HEADER_WIDTH:
                 menu = QMenu(self)
                 rem_act = menu.addAction("Remove Audio Track")
@@ -3596,7 +3930,7 @@ class TrackArrangeView(QWidget):
         dx = ev.angleDelta().x()
         dy = ev.angleDelta().y()
         if ev.modifiers() & Qt.ControlModifier:
-            # Ctrl+scroll → zoom
+            # Ctrl+scroll -> zoom
             if dy > 0:
                 self.zoom_in()
             elif dy < 0:
@@ -3606,6 +3940,55 @@ class TrackArrangeView(QWidget):
         self._view_x = max(0.0, self._view_x + delta / 120)
         self.scroll_x_changed.emit(self._view_x)
         self.update()
+
+    # -- Drag-and-drop --------------------------------------------------------
+
+    def dragEnterEvent(self, ev) -> None:
+        """
+        Accept a drag event when at least one dragged URL is a known MIDI or
+        audio file. The cursor changes to a copy icon to signal acceptance.
+        """
+        if ev.mimeData().hasUrls():
+            paths = [u.toLocalFile() for u in ev.mimeData().urls()]
+            if any(detect_file_type(p) is not None for p in paths):
+                ev.acceptProposedAction()
+                return
+        ev.ignore()
+
+    def dragMoveEvent(self, ev) -> None:
+        """
+        Keep accepting the drag as the cursor moves over the widget so the OS
+        maintains the copy cursor. No visual beat-line is drawn here to keep
+        the implementation simple.
+        """
+        if ev.mimeData().hasUrls():
+            ev.acceptProposedAction()
+        else:
+            ev.ignore()
+
+    def dropEvent(self, ev) -> None:
+        """
+        Collect dropped file paths, compute the beat position from the cursor
+        X coordinate, and emit files_dropped(paths, beat).
+
+        The MainWindow slot _on_files_dropped() does the actual importing so
+        this widget stays decoupled from the data layer.
+        """
+        if not ev.mimeData().hasUrls():
+            ev.ignore()
+            return
+
+        paths = [u.toLocalFile() for u in ev.mimeData().urls()]
+        paths = [p for p in paths if detect_file_type(p) is not None]
+
+        if not paths:
+            ev.ignore()
+            return
+
+        # Translate cursor X into a beat position (snapped to whole beats).
+        beat = max(0.0, round(self._x_to_beat(ev.position().x())))
+        ev.acceptProposedAction()
+        self.files_dropped.emit(paths, beat)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3641,9 +4024,78 @@ class MainWindow(QMainWindow):
         self._effect_chains: Dict[int, EffectChain] = {}
         self._pygame_sounds: Dict[str, object] = {}
         self._gamepad_timer: Optional[QTimer] = None   # drives controller.poll_once()
-        self._instrument_names: Dict[int, str] = {}    # channel → current preset name
+        self._instrument_names: Dict[int, str] = {}    # channel -> current preset name
         self._note_clipboard:  List[dict]     = []    # copy/paste buffer for piano roll notes
+
+        # Per-audio-track FX engine and FX chain registry.
+        self._audio_player  = AudioFilePlayer()
+        self._audio_fx_chains: Dict[int, AudioFxChain] = {}  # track_id -> chain
+
+        # Per-MIDI-track FX chain registry (keyed by MIDI channel number).
+        # Each entry is an AudioFxChain whose plugins may include instrument
+        # plugins (e.g. SamplerPlugin) as well as C++ insert effects.
+        self._midi_fx_chains: Dict[int, AudioFxChain] = {}   # channel -> chain
+
+        # Per-MIDI-track real-time renderers for instrument plugins.
+        # An InstrumentRenderer owns a sounddevice OutputStream that renders
+        # the matching AudioFxChain in real time.
+        self._instrument_renderers: Dict[int, object] = {}   # channel -> renderer
+
+        # Centralised import helper.
+        self._import_manager = ImportManager()
+
+        # Channel Rack window (created early so _wire_signals can connect it).
+        self._channel_rack = ChannelRackWindow(self)
+        # Populate with a default set of drum rows.
+        # Each row uses a unique row_id (assigned automatically, ≥ 32) so that
+        # Copy-to-Timeline creates one separate MidiTrack per drum.
+        _default_rack_rows = [
+            ChannelStepData(name="Kick",    channel=9, note=36, velocity=110),
+            ChannelStepData(name="Snare",   channel=9, note=38, velocity=100),
+            ChannelStepData(name="Hi-Hat",  channel=9, note=42, velocity=80),
+            ChannelStepData(name="Open HH", channel=9, note=46, velocity=75),
+        ]
+        self._channel_rack.set_rows(_default_rack_rows)
+        # Register the shared step-row list with MidiLogic so events are baked
+        # into _build_flat_events() for sample-accurate timing.
+        self._midi.set_step_rows(self._channel_rack.get_rows())
+
+        # Per-row sample engine for the Channel Rack.
+        # Each rack row can have an audio sample loaded; this engine plays it
+        # in real-time when a step fires (independently of FluidSynth).
+        self._rack_engine = RackSamplerEngine()
+
+        # Mapping of rack row_id → MIDI channel used as FluidSynth fallback
+        # when no sample is loaded for that row.
+        self._rack_row_fluid_ch: dict = {
+            row.row_id: row.channel for row in _default_rack_rows
+        }
+        # Mapping of rack row_id → root MIDI note for pitch-shifted sample playback.
+        self._rack_row_note: dict = {
+            row.row_id: row.note for row in _default_rack_rows
+        }
+
+        # Waveform peak generator — loads audio peaks on daemon threads so the
+        # arrange view can render waveforms without blocking the GUI.
+        self._waveform_gen = WaveformPeakGenerator()
+
+        # Per-channel velocity humanizers: channel → VelocityHumanizer instance.
+        # Created on demand when the user enables humanization for a track.
+        self._midi_humanizers: dict = {}
+        # Saved humanizer parameter dicts: channel → params dict.
+        # Persisted here so settings survive track deselection / panel reloads.
+        self._humanizer_params: dict = {}
+
+        # Export worker reference -- kept alive to prevent mid-run GC.
+        self._export_worker = None
+
+        # C++ timeline engine bridge — handles MIDI scheduling and audio mixing.
+        # Initialised before the toolbar so BPM changes from the transport bar
+        # can propagate to the bridge immediately.
+        self._timeline_bridge = None
+
         self._init_audio_clip_playback()
+        self._init_timeline_bridge()
 
         self.setWindowTitle("SBS-Synth Master  ✦  Crystal DAW")
         self.setMinimumSize(1200, 750)
@@ -3668,26 +4120,77 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _init_audio_clip_playback(self) -> None:
-        """Init pygame.mixer for audio clip playback and wire the callback."""
+        """
+        Initialise pygame.mixer and wire the AudioFilePlayer as the audio callback.
+
+        AudioFilePlayer.play_clip() is called by MidiLogic for every audio clip
+        that fires during playback. It handles per-track DSP effects, volume,
+        and pan before handing the processed audio to a dedicated pygame channel.
+        """
         try:
             import pygame
             pygame.mixer.pre_init(44100, -16, 2, 4096)
             pygame.mixer.init()
+            # AudioFilePlayer was constructed before pygame.mixer.init() ran, so its
+            # first _init_pygame() attempt silently failed.  Re-run it now that the
+            # mixer is ready so _pygame_ok becomes True and channel allocation works.
+            self._audio_player._init_pygame()
+            # Register the clip-start callback (track_id, path, duration_secs, offset).
             self._midi.set_audio_callback(self._play_audio_file)
+            # Register the stop-all callback so AudioLoopScheduler can halt
+            # playing clips at the precise loop boundary.
+            self._midi.set_stop_audio_callback(self._audio_player.stop_all)
             logger.info("pygame.mixer initialised for audio clip playback.")
         except Exception as exc:
-            logger.warning("pygame.mixer init failed — audio clips will be silent: %s", exc)
+            logger.warning(
+                "pygame.mixer init failed -- audio clips will be silent: %s", exc)
 
-    def _play_audio_file(self, path: str, duration_secs: float = 0.0) -> None:
-        """Called from the playback thread to trigger a clip sound."""
+    def _init_timeline_bridge(self) -> None:
+        """
+        Create and attach the C++ TimelineEngineBridge to MidiLogic.
+
+        On success the bridge owns the sounddevice output stream and all
+        MIDI events from the C++ engine are routed through _note_event_callback.
+        If the C++ extension is not built the bridge degrades to a no-op and
+        MidiLogic falls back to its Python playback loop transparently.
+        """
         try:
-            import pygame
-            if path not in self._pygame_sounds:
-                self._pygame_sounds[path] = pygame.mixer.Sound(path)
-            maxtime = int(duration_secs * 1000) if duration_secs > 0 else 0
-            self._pygame_sounds[path].play(maxtime=maxtime)
+            from .timeline_engine_bridge import TimelineEngineBridge
+            bpm = float(self._midi.bpm)
+            bridge = TimelineEngineBridge(sample_rate=44100, bpm=bpm)
+            bridge.set_midi_dispatch(self._note_event_callback)
+            if bridge.is_available:
+                bridge.open_stream()
+            self._timeline_bridge = bridge
+            self._midi.attach_bridge(bridge)
+            if bridge.is_available:
+                logger.info("C++ TimelineEngineBridge active — "
+                            "using hardware-accelerated audio/MIDI scheduling.")
+            else:
+                logger.info("TimelineEngineBridge created in no-op mode — "
+                            "C++ extension not built; Python playback loop in use.")
         except Exception as exc:
-            logger.warning("Audio clip play error (%s): %s", path, exc)
+            logger.warning("_init_timeline_bridge failed: %s", exc)
+
+    def _play_audio_file(self, track_id: int, path: str,
+                         duration_secs: float = 0.0,
+                         start_offset_secs: float = 0.0) -> None:
+        """
+        Audio callback fired from the MidiLogic playback thread.
+
+        Routes playback through AudioFilePlayer so per-track DSP effects
+        (EQ, reverb, compressor, chorus, volume, pan) are applied before
+        the audio reaches the pygame mixer channel.
+
+        Args:
+            track_id          : AudioTrack.track_id -- selects the FX chain.
+            path              : Absolute path to the audio file.
+            duration_secs     : Maximum play time (0 = full file).
+            start_offset_secs : Seconds to skip at the start of the file.
+                                Non-zero when the user seeked into a clip.
+        """
+        self._audio_player._play_clip_from_offset(
+            track_id, path, duration_secs, start_offset_secs)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -3715,19 +4218,35 @@ class MainWindow(QMainWindow):
 
         tb.addWidget(_btn("✦ NEW PROJECT",  "Clear all tracks and start fresh",
                           self._on_new_project, C["purple"]))
+        tb.addWidget(_btn("💾 SAVE PROJECT", "Save full project to .dawproj",
+                          self._on_save_project, C["cyan"]))
+        tb.addWidget(_btn("📂 LOAD PROJECT", "Load a .dawproj project file",
+                          self._on_load_project, C["cyan"]))
+        tb.addSeparator()
+        # Channel Rack placed early so it is always visible even on narrow screens.
+        tb.addWidget(_btn("🎹 CHANNEL RACK",
+                          "Open / close the step sequencer (Channel Rack)",
+                          self._on_toggle_channel_rack, C["pink"]))
         tb.addSeparator()
         tb.addWidget(_btn("+ ADD TRACK",    "Add a new instrument track",
                           self._on_add_track))
-        tb.addWidget(_btn("+ ADD AUDIO CLIP",
-                          "Place an audio sample in the arrangement view",
-                          self._on_add_audio_clip_toolbar, C["gold"]))
         tb.addSeparator()
         tb.addWidget(_btn("💾 SAVE MIDI",   "Export tracks to .mid",
                           self._on_save_midi))
-        tb.addWidget(_btn("📂 OPEN MIDI",   "Import from .mid file",
+        tb.addWidget(_btn("📂 LOAD MIDI",
+                          "Replace project with one MIDI file",
                           self._on_open_midi))
+        tb.addWidget(_btn("📂+ IMPORT MIDI",
+                          "Add MIDI file(s) to the current project "
+                          "(each file keeps its own tracks)",
+                          self._on_import_midi_files, C["cyan"]))
+        tb.addWidget(_btn("🎵+ IMPORT AUDIO",
+                          "Add multiple audio files — each gets its own track",
+                          self._on_import_audio_files, C["gold"]))
         tb.addWidget(_btn("🎵 EXPORT",      "Export to WAV or MP3",
                           self._on_export, C["gold"]))
+        tb.addWidget(_btn("🎚 MASTER",      "Multi-format mastering export (MP3 / WAV / Stems)",
+                          self._on_master_export, C["cyan"]))
         tb.addSeparator()
         tb.addWidget(_btn("🎮 GAMEPAD",     "Connect PS5 DualSense",
                           self._on_connect_gamepad))
@@ -3744,6 +4263,8 @@ class MainWindow(QMainWindow):
     def _setup_piano_roll(self) -> None:
         self._piano_roll   = PianoRollWidget()
         self._arrange_view = TrackArrangeView()
+        # Wire the background waveform loader so audio clips show peaks.
+        self._arrange_view.set_waveform_generator(self._waveform_gen)
         self._clip_lane    = AudioClipLane()   # data backend kept alive
 
         # ── Page 0: Arrangement view ────────────────────────────────
@@ -3809,13 +4330,29 @@ class MainWindow(QMainWindow):
         zr_lay.addWidget(zoom_out_btn)
         zr_lay.addWidget(zoom_in_btn)
 
+        # AutomationPanel sits in a vertical splitter directly below the
+        # arrangement view.  It is hidden until the first automation lane
+        # is opened via the AUTO button in a track header.
+        self._auto_panel = AutomationPanel()
+
+        # Vertical splitter: arrangement on top, automation panel below
+        self._arrange_splitter = QSplitter(Qt.Vertical)
+        self._arrange_splitter.setHandleWidth(4)
+        self._arrange_splitter.setStyleSheet(
+            f"QSplitter::handle {{ background:{C['surface']}; }}")
+        self._arrange_splitter.addWidget(arrange_scroll)
+        self._arrange_splitter.addWidget(self._auto_panel)
+        # Give all available space to the arrangement view initially
+        self._arrange_splitter.setSizes([600, 0])
+        self._arrange_splitter.setCollapsible(0, False)
+
         arrange_panel = QWidget()
         arrange_panel.setStyleSheet(f"background:{C['abyss']};")
         ap_lay = QVBoxLayout(arrange_panel)
         ap_lay.setContentsMargins(0, 0, 0, 0)
         ap_lay.setSpacing(0)
         ap_lay.addWidget(zoom_row)
-        ap_lay.addWidget(arrange_scroll, stretch=1)
+        ap_lay.addWidget(self._arrange_splitter, stretch=1)
         ap_lay.addWidget(self._arrange_hscroll)
 
         # ── Page 1: Piano roll ──────────────────────────────────────
@@ -3915,22 +4452,11 @@ class MainWindow(QMainWindow):
         )
         self._draw_mode_btn.toggled.connect(self._on_draw_mode_toggled)
 
-        # Grid size selector
-        grid_lbl = QLabel("GRID")
-        grid_lbl.setStyleSheet(
-            f"color:{C['text_dim']}; font-size:10px; background:transparent;")
-        self._grid_combo = QComboBox()
-        self._grid_combo.addItems(["1/16", "1/8", "1/4", "1/2", "1"])
-        self._grid_combo.setCurrentText("1/16")
-        self._grid_combo.setFixedWidth(60)
-        self._grid_combo.setStyleSheet(
-            f"QComboBox {{ background:{C['deep']}; color:{C['cyan']};"
-            f" border:1px solid rgba(0,229,255,0.3); border-radius:4px;"
-            f" padding:2px 6px; font-size:11px; }}"
-            f"QComboBox::drop-down {{ border:none; }}"
-            f"QComboBox QAbstractItemView {{ background:{C['surface']};"
-            f" color:{C['text']}; selection-background-color:{C['deep']}; }}")
-        self._grid_combo.currentTextChanged.connect(self._piano_roll.set_grid_size)
+        # Grid settings panel — note values, triplets/dotted/Free, ruler mode.
+        self._grid_panel = GridSettingsPanel()
+        self._grid_panel.grid_changed.connect(self._piano_roll.set_grid_size)
+        self._grid_panel.ruler_changed.connect(self._piano_roll.set_ruler_mode)
+        self._grid_panel.fps_changed.connect(self._piano_roll.set_ruler_fps)
 
         tlay = QHBoxLayout(title_bar)
         tlay.setContentsMargins(6, 3, 6, 3)
@@ -3939,8 +4465,7 @@ class MainWindow(QMainWindow):
         tlay.addWidget(self._vst_edit_btn)
         tlay.addWidget(self._piano_roll_title, stretch=1)
         tlay.addWidget(self._draw_mode_btn)
-        tlay.addWidget(grid_lbl)
-        tlay.addWidget(self._grid_combo)
+        tlay.addWidget(self._grid_panel)
 
         # Velocity lane toggle button
         self._vel_toggle_btn = QPushButton("≡ VEL")
@@ -4000,6 +4525,9 @@ class MainWindow(QMainWindow):
 
     def _setup_mixer(self) -> None:
         self._mixer_strips: Dict[int, MixerStrip] = {}
+        # Separate registry for audio-track strips so MIDI and audio strips
+        # can be managed independently (different key spaces: channel vs track_id).
+        self._audio_mixer_strips: Dict[int, AudioMixerStrip] = {}
         self._mixer_inner  = QWidget()
         self._mixer_inner.setStyleSheet(f"background:{C['abyss']};")
         self._mixer_layout = QHBoxLayout(self._mixer_inner)
@@ -4014,11 +4542,35 @@ class MainWindow(QMainWindow):
         mixer_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         mixer_scroll.setStyleSheet(f"background:{C['abyss']}; border:none;")
 
+        # Create the C++ MasterBus (or Python fallback) and connect to the player.
+        self._master_bus = get_master_bus(44100.0)
+        self._audio_player.set_master_bus(self._master_bus)
+
+        # Master bus channel strip — fixed width, always visible at the far right.
+        self._master_bus_channel = MasterBusChannel(self._master_bus)
+
+        # Thin vertical separator between track strips and master strip.
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet(f"color: rgba(0,229,255,0.25); background: rgba(0,229,255,0.12);")
+        sep.setFixedWidth(2)
+
+        # Outer container: scrollable track area + separator + master strip.
+        mixer_outer = QWidget()
+        mixer_outer.setStyleSheet(f"background:{C['abyss']};")
+        outer_layout = QHBoxLayout(mixer_outer)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+        outer_layout.addWidget(mixer_scroll, stretch=1)
+        outer_layout.addWidget(sep)
+        outer_layout.addWidget(self._master_bus_channel)
+
         dock = QDockWidget("MIXER", self)
-        dock.setWidget(mixer_scroll)
+        dock.setWidget(mixer_outer)
         self.addDockWidget(Qt.BottomDockWidgetArea, dock)
 
     def _setup_effects_dock(self) -> None:
+        # -- MIDI instrument FX panel -----------------------------------------
         self._effects_panel = EffectsPanel()
         scroll = QScrollArea()
         scroll.setWidget(self._effects_panel)
@@ -4026,9 +4578,30 @@ class MainWindow(QMainWindow):
         scroll.setFixedWidth(240)
         scroll.setStyleSheet(f"background:{C['abyss']}; border:none;")
 
-        dock = QDockWidget("EFFECTS", self)
-        dock.setWidget(scroll)
-        self.addDockWidget(Qt.RightDockWidgetArea, dock)
+        self._midi_fx_dock = QDockWidget("EFFECTS", self)
+        self._midi_fx_dock.setWidget(scroll)
+        self.addDockWidget(Qt.RightDockWidgetArea, self._midi_fx_dock)
+
+        # -- Audio track FX panel ---------------------------------------------
+        # Shown when the user clicks the FX button on an AudioMixerStrip.
+        self._audio_fx_panel = AudioFxPanel()
+        self._audio_fx_dock = QDockWidget("AUDIO FX", self)
+        self._audio_fx_dock.setWidget(self._audio_fx_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self._audio_fx_dock)
+        # Tabify the two right-side docks so they share the same space.
+        self.tabifyDockWidget(self._midi_fx_dock, self._audio_fx_dock)
+
+        # -- Velocity Humanizer dock ------------------------------------------
+        # One shared HumanizerPanel reloaded per track.  Tabified with the
+        # other right-side docks so it does not take extra screen space.
+        self._humanizer_panel = HumanizerPanel()
+        self._humanizer_dock  = QDockWidget("HUMANIZE", self)
+        self._humanizer_dock.setWidget(self._humanizer_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self._humanizer_dock)
+        self.tabifyDockWidget(self._audio_fx_dock, self._humanizer_dock)
+
+        # Default to showing the MIDI effects panel.
+        self._midi_fx_dock.raise_()
 
     def _setup_status_bar(self) -> None:
         sb = QStatusBar()
@@ -4048,7 +4621,10 @@ class MainWindow(QMainWindow):
         t.stop_clicked.connect(self._on_stop)
         t.record_clicked.connect(self._on_record_toggled)
         t.bpm_changed.connect(lambda v: setattr(self._midi, "bpm", v))
+        t.bpm_changed.connect(lambda v: self._timeline_bridge.set_bpm(v)
+                              if self._timeline_bridge is not None else None)
         t.bpm_changed.connect(self._clip_lane.set_bpm)
+        t.bpm_changed.connect(self._channel_rack.set_bpm)
         t.panic_btn.clicked.connect(self._engine.all_notes_off)
         t.scale_combo.currentTextChanged.connect(self._on_scale_changed)
         t.root_combo .currentTextChanged.connect(self._on_scale_changed)
@@ -4086,6 +4662,8 @@ class MainWindow(QMainWindow):
         self._vel_toggle_btn.toggled        .connect(self._on_vel_lane_toggled)
 
         self._arrange_view.track_selected             .connect(self._on_track_header_selected)
+        self._arrange_view.audio_track_selected       .connect(self._on_audio_track_selected)
+        self._arrange_view.files_dropped              .connect(self._on_files_dropped)
         self._arrange_view.clip_selected              .connect(self._on_clip_selected)
         self._arrange_view.clip_edit_requested        .connect(self._on_clip_edit_requested)
         self._arrange_view.clip_moved                 .connect(self._on_midi_clip_moved)
@@ -4105,7 +4683,25 @@ class MainWindow(QMainWindow):
         self._arrange_view.seek_requested             .connect(self._on_seek)
         self._arrange_view.change_instrument_requested.connect(self._on_change_instrument)
         self._arrange_view.remove_track_requested     .connect(self._on_remove_track)
+        self._arrange_view.midi_fx_requested          .connect(self._on_midi_track_fx_requested)
         self._arrange_hscroll.valueChanged            .connect(self._on_arrange_hscroll)
+        # Automation panel scroll + zoom synchronisation
+        self._arrange_view.scroll_x_changed .connect(self._auto_panel.set_view_x)
+        self._arrange_view.zoom_changed     .connect(self._auto_panel.set_beat_width)
+        # Automation toggle from track header AUTO button
+        self._arrange_view.automation_toggled.connect(self._on_automation_toggled)
+        # Channel Rack: note events route to RackSamplerEngine (or FluidSynth fallback)
+        self._channel_rack.note_on_requested    .connect(self._on_rack_note_on)
+        self._channel_rack.note_off_requested   .connect(self._on_rack_note_off)
+        self._channel_rack.copy_requested       .connect(self._on_rack_copy_to_timeline)
+        self._channel_rack.sample_load_requested.connect(self._on_rack_sample_loaded)
+
+        # Audio FX panel: push chain updates to the player in real time.
+        self._audio_fx_panel.chain_changed.connect(self._on_audio_fx_changed)
+
+        # Humanizer panel: update the per-channel humanizer whenever the user
+        # changes a slider or toggles enable/disable.
+        self._humanizer_panel.params_changed.connect(self._on_humanizer_params_changed)
 
         self._clip_lane.clip_added    .connect(self._on_clip_added)
         self._clip_lane.clip_removed  .connect(self._on_clip_removed)
@@ -4117,6 +4713,320 @@ class MainWindow(QMainWindow):
     # Track management
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Audio track FX slots
+    # ------------------------------------------------------------------
+
+    @Slot(int)
+    def _on_audio_track_selected(self, track_id: int) -> None:
+        """
+        Show the AudioFxPanel for the selected audio track.
+
+        Creates a neutral AudioFxChain on first selection so the panel always
+        has something to display. The chain is registered with AudioFilePlayer
+        so subsequent play_clip() calls use the correct DSP.
+        """
+        atrack = self._midi.get_audio_track(track_id)
+        if atrack is None:
+            return
+
+        # Create a chain if this track has not been configured before.
+        if track_id not in self._audio_fx_chains:
+            chain = AudioFxChain(track_id=track_id)
+            self._audio_fx_chains[track_id] = chain
+            self._audio_player.register_track(track_id, chain)
+
+        chain = self._audio_fx_chains[track_id]
+        self._audio_fx_panel.load_chain(chain, atrack.name)
+        # Bring the Audio FX tab to the front so the user can see the controls.
+        self._audio_fx_dock.raise_()
+
+        # Ensure the panel's change signal is wired to the audio-track handler.
+        # If a MIDI track was previously selected, the signal may be connected
+        # to _on_midi_fx_changed instead — swap back to the audio handler.
+        try:
+            self._audio_fx_panel.chain_changed.disconnect(self._on_midi_fx_changed)
+        except Exception:
+            pass
+        try:
+            self._audio_fx_panel.chain_changed.disconnect(self._on_audio_fx_changed)
+        except Exception:
+            pass
+        self._audio_fx_panel.chain_changed.connect(self._on_audio_fx_changed)
+
+    @Slot(int)
+    def _on_midi_track_fx_requested(self, channel: int) -> None:
+        """
+        Show the AudioFxPanel for a MIDI instrument track.
+
+        Creates an AudioFxChain for the channel on first request and starts
+        an InstrumentRenderer so that instrument plugins (e.g. SamplerPlugin)
+        in the rack produce real-time audio output.  Subsequent FX changes on
+        this chain are handled by _on_midi_fx_changed().
+
+        Args:
+            channel: MIDI channel number (0-based) of the track.
+        """
+        track = self._midi.get_track(channel)
+        if track is None:
+            return
+
+        # Create the FX chain for this MIDI channel if it doesn't exist yet.
+        if channel not in self._midi_fx_chains:
+            chain = AudioFxChain(track_id=channel)
+            self._midi_fx_chains[channel] = chain
+
+        chain = self._midi_fx_chains[channel]
+
+        # Ensure a real-time InstrumentRenderer exists for this channel so
+        # instrument plugins added to the chain produce audio output.
+        if channel not in self._instrument_renderers:
+            renderer = InstrumentRenderer()
+            renderer.set_chain(chain)
+            renderer.start()
+            self._instrument_renderers[channel] = renderer
+        else:
+            # Renderer already exists — make sure it has the current chain ref.
+            self._instrument_renderers[channel].set_chain(chain)
+
+        # Load the chain into the shared AudioFxPanel and bring it forward.
+        self._audio_fx_panel.load_chain(chain, track.name)
+        self._audio_fx_dock.raise_()
+
+        # Also populate the humanizer panel for this channel so the user can
+        # switch to the HUMANIZE tab to configure velocity variation.
+        self._humanizer_panel.load_channel(
+            channel,
+            track.name,
+            self._humanizer_params.get(channel),
+        )
+
+        # Connect the panel's change signal to the MIDI-specific handler so
+        # parameter edits don't accidentally restart audio-file playback.
+        # (Disconnect first to avoid double-connecting on repeated clicks.)
+        try:
+            self._audio_fx_panel.chain_changed.disconnect(self._on_audio_fx_changed)
+        except Exception:
+            pass
+        try:
+            self._audio_fx_panel.chain_changed.disconnect(self._on_midi_fx_changed)
+        except Exception:
+            pass
+        self._audio_fx_panel.chain_changed.connect(self._on_midi_fx_changed)
+
+    @Slot(int)
+    def _on_midi_fx_changed(self, channel: int) -> None:
+        """
+        Push updated MIDI-track FX chain to the InstrumentRenderer.
+
+        Called whenever the user adds, removes, or tweaks a plugin in the FX
+        rack while a MIDI track is selected.  The renderer's set_chain() call
+        is cheap (single reference swap) and takes effect on the next audio
+        block — no audio is interrupted.
+        """
+        chain = self._midi_fx_chains.get(channel)
+        if chain is None:
+            return
+
+        renderer = self._instrument_renderers.get(channel)
+        if renderer is not None:
+            renderer.set_chain(chain)
+
+        # Reconnect the panel's change signal back to the audio-track handler
+        # when the user later selects an audio track (handled in
+        # _on_audio_track_selected which calls load_chain and reconnects).
+
+    @Slot(int)
+    def _on_audio_fx_changed(self, track_id: int) -> None:
+        """
+        Push the updated AudioFxChain to AudioFilePlayer after any GUI edit.
+
+        Changes take effect on the next clip playback. The player does not
+        re-render already-playing audio (offline DSP model).
+        Also syncs the AudioMixerStrip so its volume/pan/mute/solo sliders
+        reflect any edits made via the AudioFxPanel (e.g. volume in the panel).
+        """
+        chain = self._audio_fx_chains.get(track_id)
+        if chain is not None:
+            self._audio_player.update_fx_chain(track_id, chain)
+            strip = self._audio_mixer_strips.get(track_id)
+            if strip is not None:
+                strip.sync_from_chain(chain)
+
+    @Slot(int, dict)
+    def _on_humanizer_params_changed(self, channel: int, params: dict) -> None:
+        """
+        Called whenever the user moves a slider or toggles enable in the
+        HumanizerPanel.  Saves the params and rebuilds the per-channel
+        VelocityHumanizer instance so the next note event uses the new values.
+        """
+        # Persist the params dict so they survive panel reloads.
+        self._humanizer_params[channel] = params
+
+        if params.get("enabled", False):
+            # Recreate the humanizer with the new parameters.
+            # get_humanizer() tries C++ first, falls back to Python.
+            self._midi_humanizers[channel] = get_humanizer(
+                sigma             = params.get("sigma",             8.0),
+                downbeat_boost    = params.get("downbeat_boost",    0.15),
+                offbeat_reduction = params.get("offbeat_reduction", 0.08),
+                time_sig_num      = params.get("time_sig_num",      4),
+                time_sig_denom    = params.get("time_sig_denom",    4),
+            )
+        else:
+            # Disabled — remove the instance so _note_event_callback skips it.
+            self._midi_humanizers.pop(channel, None)
+
+    def _register_audio_track_with_player(self, track_id: int) -> None:
+        """
+        Ensure an AudioTrack has a chain, is registered with AudioFilePlayer,
+        and has an AudioMixerStrip visible in the mixer panel.
+
+        Idempotent — safe to call multiple times for the same track_id.
+        """
+        # Create FX chain if this is the first registration.
+        if track_id not in self._audio_fx_chains:
+            chain = AudioFxChain(track_id=track_id)
+            self._audio_fx_chains[track_id] = chain
+        self._audio_player.register_track(
+            track_id, self._audio_fx_chains[track_id])
+
+        # Create mixer strip only once per track.
+        if track_id not in self._audio_mixer_strips:
+            atrack = self._midi.get_audio_track(track_id)
+            name   = atrack.name  if atrack else f"Audio {track_id}"
+            color  = atrack.color if atrack else C["gold"]
+
+            strip = AudioMixerStrip(track_id, name, color)
+            # Volume and pan feed directly into AudioFilePlayer / AudioFxChain.
+            strip.volume_changed.connect(self._audio_player.set_volume)
+            strip.pan_changed   .connect(self._audio_player.set_pan)
+            strip.mute_toggled  .connect(self._audio_player.set_mute)
+            strip.solo_toggled  .connect(self._audio_player.set_solo)
+            # Remove button triggers the same slot as the arrangement-view header.
+            strip.remove_clicked.connect(self._on_audio_track_remove)
+            # FX button opens the AudioFxPanel in the side dock.
+            strip.fx_clicked    .connect(self._on_audio_track_selected)
+
+            strip.sync_from_chain(self._audio_fx_chains[track_id])
+            self._audio_mixer_strips[track_id] = strip
+            self._mixer_layout.addWidget(strip)
+
+    # ------------------------------------------------------------------
+    # Import slots (toolbar buttons and drag-drop)
+    # ------------------------------------------------------------------
+
+    @Slot(list, float)
+    def _on_files_dropped(self, paths: list, beat: float) -> None:
+        """
+        Handle files dragged and dropped onto the arrangement view.
+
+        MIDI files are appended as new tracks. Audio files each become a
+        new audio track placed at the drop beat position.
+        """
+        if not paths:
+            return
+
+        midi_tracks, audio_tracks = self._import_manager.import_files(
+            paths, self._midi, start_beat=beat, append=True,
+        )
+
+        # Register new MIDI tracks in the engine with a default instrument.
+        for track in midi_tracks:
+            chain = EffectChain(channel=track.channel)
+            self._effect_chains[track.channel] = chain
+            self._engine.apply_effect_chain(chain)   # override FluidSynth defaults
+            col = C["tracks"][track.channel % len(C["tracks"])]
+            track.color = col
+            strip = self._make_mixer_strip(track.channel, track.name, col)
+            self._mixer_strips[track.channel] = strip
+            self._mixer_layout.addWidget(strip)
+
+        # Register new audio tracks with the player.
+        for atrack in audio_tracks:
+            self._register_audio_track_with_player(atrack.track_id)
+
+        self._refresh_piano_roll()
+
+    @Slot()
+    def _on_import_midi_files(self) -> None:
+        """
+        Open a multi-file dialog for MIDI files and append them to the project.
+
+        Each file's tracks are added without clearing existing tracks. Channel
+        collisions are resolved automatically by ImportManager.
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Import MIDI Files (append to project)",
+            os.path.expanduser("~"),
+            "MIDI Files (*.mid *.midi);;All Files (*)",
+        )
+        if not paths:
+            return
+
+        new_tracks = self._import_manager.import_midi_files(
+            paths, self._midi, append=True,
+        )
+
+        for track in new_tracks:
+            chain = EffectChain(channel=track.channel)
+            self._effect_chains[track.channel] = chain
+            self._engine.apply_effect_chain(chain)   # override FluidSynth defaults
+            col = C["tracks"][track.channel % len(C["tracks"])]
+            track.color = col
+            strip = self._make_mixer_strip(track.channel, track.name, col)
+            self._mixer_strips[track.channel] = strip
+            self._mixer_layout.addWidget(strip)
+
+        self._refresh_piano_roll()
+
+        if new_tracks:
+            self._on_track_selected(new_tracks[0].channel)
+
+    @Slot()
+    def _on_import_audio_files(self) -> None:
+        """
+        Open a multi-file dialog for audio files.
+
+        Every selected file becomes its own audio track placed at beat 0.
+        The user can then drag the clip to the desired position.
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Import Audio Files",
+            os.path.expanduser("~"),
+            "Audio Files (*.wav *.mp3 *.ogg *.flac *.aiff *.m4a);;All Files (*)",
+        )
+        if not paths:
+            return
+
+        new_audio_tracks = self._import_manager.import_audio_files(
+            paths, self._midi, start_beat=0.0,
+        )
+
+        for atrack in new_audio_tracks:
+            self._register_audio_track_with_player(atrack.track_id)
+
+        self._refresh_piano_roll()
+
+    def _make_mixer_strip(self, channel: int, name: str, color: str) -> "MixerStrip":
+        """
+        Create and wire a MixerStrip without adding a MIDI track.
+
+        Used when importing MIDI files via ImportManager (the track already
+        exists in midi_logic; only the UI strip needs to be created).
+        """
+        strip = MixerStrip(channel, name, color)
+        strip.gain_changed  .connect(self._engine.set_gain)
+        strip.pan_changed   .connect(self._engine.set_pan)
+        strip.mute_toggled  .connect(self._engine.set_mute)
+        strip.solo_toggled  .connect(self._engine.set_solo)
+        strip.track_selected.connect(self._on_track_selected)
+        strip.remove_clicked.connect(self._on_remove_track)
+        strip.name_changed  .connect(self._on_track_renamed)
+        return strip
+
     def add_track(self, track: MidiTrack, plugin: InstrumentPlugin) -> None:
         """Add a track to the sequencer, engine, and mixer UI."""
         self._midi.add_track(track)
@@ -4124,8 +5034,12 @@ class MainWindow(QMainWindow):
         if plugin.sf2_path and os.path.isfile(plugin.sf2_path):
             self._engine.register_instrument(plugin)
 
-        # Create default effect chain for this channel.
+        # Create default effect chain and push it to FluidSynth immediately.
+        # Without this, FluidSynth runs with its built-in defaults (heavy reverb
+        # at level ~0.9) until the user touches a slider, making the Effects panel
+        # appear broken.
         self._effect_chains[track.channel] = EffectChain(channel=track.channel)
+        self._engine.apply_effect_chain(self._effect_chains[track.channel])
 
         strip = MixerStrip(track.channel, track.name, track.color)
         strip.gain_changed  .connect(self._engine.set_gain)
@@ -4158,6 +5072,13 @@ class MainWindow(QMainWindow):
         self._midi.remove_track(channel)
         self._effect_chains.pop(channel, None)
         self._instrument_names.pop(channel, None)
+
+        # Stop and discard any InstrumentRenderer for this channel so the
+        # sounddevice stream is closed and its thread exits cleanly.
+        renderer = self._instrument_renderers.pop(channel, None)
+        if renderer is not None:
+            renderer.stop()
+        self._midi_fx_chains.pop(channel, None)
 
         strip = self._mixer_strips.pop(channel, None)
         if strip:
@@ -4291,6 +5212,10 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_stop(self) -> None:
         self._midi.stop()
+        # Stop all audio file tracks immediately — pygame channels keep playing
+        # independently of the MidiLogic playback thread, so they must be halted
+        # explicitly here alongside the MIDI stop.
+        self._audio_player.stop_all()
         if self._midi._recording:
             self._midi.stop_recording()
             self._transport.record_btn.setChecked(False)
@@ -4440,6 +5365,16 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_audio_track_remove(self, track_id: int) -> None:
+        # Stop playback and release the pygame channel for this track.
+        self._audio_player.unregister_track(track_id)
+        self._audio_fx_chains.pop(track_id, None)
+
+        # Remove the AudioMixerStrip from the mixer panel.
+        strip = self._audio_mixer_strips.pop(track_id, None)
+        if strip is not None:
+            self._mixer_layout.removeWidget(strip)
+            strip.deleteLater()
+
         self._midi.remove_audio_track(track_id)
         self._refresh_piano_roll()
 
@@ -4490,6 +5425,15 @@ class MainWindow(QMainWindow):
         chain = self._effect_chains.get(channel)
         if chain:
             self._effects_panel.load_chain(chain, self._engine, name)
+            # Bring the MIDI effects tab to the front so the user can see it.
+            self._midi_fx_dock.raise_()
+
+        # Keep the humanizer panel in sync with the selected track.
+        self._humanizer_panel.load_channel(
+            channel,
+            name,
+            self._humanizer_params.get(channel),
+        )
 
     # ── View-switching helpers ─────────────────────────────────────────────
 
@@ -4618,14 +5562,22 @@ class MainWindow(QMainWindow):
 
     @Slot(float)
     def _on_seek(self, beat: float) -> None:
-        if self._midi.is_playing:
+        was_playing = self._midi.is_playing
+        if was_playing:
             self._midi.stop()
+        # Always stop currently-playing audio so it doesn't bleed over the
+        # new position.  This covers both the "seek while playing" case and
+        # the "previous playback finished, now seek before hitting play" case.
+        self._audio_player.stop_all()
+        if was_playing:
             self._midi.play(from_beat=beat)
             self._st_engine.setText("Engine: ▶ PLAYING")
         else:
             self._midi._playhead_beat = beat
-            self._arrange_view.update()
-            self._piano_roll.update()
+        # Immediately push the new beat so both views repaint the playhead line
+        # without waiting for the next 50 ms refresh tick.
+        self._piano_roll.set_playhead_beat(beat)
+        self._arrange_view.set_playhead_beat(beat)
 
     # ── Arrangement horizontal scrollbar ─────────────────────────────────────
 
@@ -4666,7 +5618,9 @@ class MainWindow(QMainWindow):
             return
         beat = max(0.0, self._arrange_view._view_x)
         name = os.path.splitext(os.path.basename(path))[0]
-        self._midi.add_audio_track(path, beat, name=name, color=C["gold"])
+        atrack = self._midi.add_audio_track(path, beat, name=name, color=C["gold"])
+        if atrack is not None:
+            self._register_audio_track_with_player(atrack.track_id)
         self._refresh_piano_roll()
         self._view_stack.setCurrentIndex(0)
 
@@ -4791,6 +5745,26 @@ class MainWindow(QMainWindow):
         for ch in list(self._vst_manager._tracks.keys()):
             self._vst_manager.remove_track(ch)
 
+        self._audio_player.stop_all()
+        for tid in list(self._audio_fx_chains.keys()):
+            self._audio_player.unregister_track(tid)
+        self._audio_fx_chains.clear()
+
+        # Stop real-time instrument renderers (MIDI tracks with FX).
+        for renderer in list(self._instrument_renderers.values()):
+            try:
+                renderer.stop()
+            except Exception:
+                pass
+        self._instrument_renderers.clear()
+        self._midi_fx_chains.clear()
+
+        # Remove all audio mixer strips from the mixer panel.
+        for strip in list(self._audio_mixer_strips.values()):
+            self._mixer_layout.removeWidget(strip)
+            strip.deleteLater()
+        self._audio_mixer_strips.clear()
+
         self._midi._tracks.clear()
         self._midi.clear_clips()
         self._effect_chains.clear()
@@ -4806,12 +5780,370 @@ class MainWindow(QMainWindow):
         self._refresh_piano_roll()
         self._st_engine.setText("Engine: ■ New Project")
 
+    # ── Project save / load ───────────────────────────────────────────────────
+
+    @Slot()
+    def _on_save_project(self) -> None:
+        """Serialise the full DAW state to a .dawproj JSON file."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Project",
+            os.path.expanduser("~/Untitled.dawproj"),
+            "Crystal DAW Project (*.dawproj);;All Files (*)",
+        )
+        if not path:
+            return
+        ok = ProjectManager.save_project(
+            path,
+            self._midi,
+            self._engine,
+            self._audio_fx_chains,
+            self._midi_fx_chains,
+            channel_rack_rows=self._channel_rack.get_rows(),
+        )
+        if ok:
+            self._st_engine.setText(f"Saved: {os.path.basename(path)}")
+            QMessageBox.information(self, "Save Project",
+                                    f"Project saved:\n{path}")
+        else:
+            QMessageBox.critical(self, "Save Project",
+                                 "Save failed — check the log for details.")
+
+    @Slot()
+    def _on_load_project(self) -> None:
+        """Load a .dawproj file and rebuild all tracks, clips, and FX chains."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Project",
+            os.path.expanduser("~"),
+            "Crystal DAW Project (*.dawproj);;All Files (*)",
+        )
+        if not path:
+            return
+
+        doc = ProjectManager.load_project(path)
+        if doc is None:
+            QMessageBox.critical(self, "Load Project",
+                                 "Could not read project file.")
+            return
+
+        # Clear the current session (same as New Project, but no confirmation).
+        self._midi.stop()
+        self._engine.all_notes_off()
+        self._audio_player.stop_all()
+        for tid in list(self._audio_fx_chains.keys()):
+            self._audio_player.unregister_track(tid)
+        self._audio_fx_chains.clear()
+        for renderer in list(self._instrument_renderers.values()):
+            try:
+                renderer.stop()
+            except Exception:
+                pass
+        self._instrument_renderers.clear()
+        self._midi_fx_chains.clear()
+        self._midi.clear_project()
+        self._effect_chains.clear()
+        self._selected_channel = 0
+        self._active_clip = None
+
+        # ── Restore BPM ───────────────────────────────────────────────────────
+        bpm = float(doc.get("bpm", 120.0))
+        self._midi.bpm = bpm
+        self._transport.bpm_spin.setValue(int(bpm))
+        if self._timeline_bridge is not None:
+            self._timeline_bridge.set_bpm(bpm)
+
+        # ── Restore MIDI tracks + clips + notes ───────────────────────────────
+        from .midi_logic import MidiTrack, MidiClip, MidiNote
+        for t in doc.get("midi_tracks", []):
+            track = MidiTrack(
+                name=t["name"], channel=t["channel"], color=t.get("color", "#4A90D9"))
+            self._midi.add_track(track)
+            for cd in t.get("clips", []):
+                clip = MidiClip(
+                    start_beat=cd["start_beat"],
+                    duration=cd["duration"],
+                    name=cd.get("name", ""),
+                    color=cd.get("color", ""),
+                    clip_id=self._midi._next_id(),
+                )
+                for nd in cd.get("notes", []):
+                    clip.notes.append(MidiNote(
+                        start_beat=nd["start_beat"],
+                        duration=nd["duration"],
+                        pitch=nd["pitch"],
+                        velocity=nd["velocity"],
+                        channel=nd["channel"],
+                        note_id=self._midi._next_id(),
+                    ))
+                track.clips.append(clip)
+
+        # ── Restore audio tracks + clips ──────────────────────────────────────
+        for at in doc.get("audio_tracks", []):
+            from .midi_logic import AudioTrack, AudioClip
+            atrack = AudioTrack(
+                name=at["name"],
+                track_id=at["track_id"],
+                color=at.get("color", "#FFD700"),
+            )
+            self._midi._audio_tracks[atrack.track_id] = atrack
+            self._midi._audio_track_counter = max(
+                self._midi._audio_track_counter, atrack.track_id + 1)
+            for cd in at.get("clips", []):
+                atrack.clips.append(AudioClip(
+                    path=cd["path"],
+                    start_beat=cd["start_beat"],
+                    name=cd.get("name", ""),
+                    duration_seconds=cd.get("duration_seconds", 0.0),
+                    color=cd.get("color", "#FFD700"),
+                    clip_id=self._midi._next_id(),
+                ))
+
+        # ── Restore audio FX chains ───────────────────────────────────────────
+        for str_tid, slots in doc.get("audio_fx_chains", {}).items():
+            tid   = int(str_tid)
+            chain = ProjectManager.rebuild_fx_chain_from_list(slots, tid)
+            if chain is not None:
+                self._audio_fx_chains[tid] = chain
+                self._audio_player.register_track(tid, chain)
+
+        # ── Restore MIDI/instrument FX chains ─────────────────────────────────
+        for str_ch, slots in doc.get("midi_fx_chains", {}).items():
+            ch    = int(str_ch)
+            chain = ProjectManager.rebuild_fx_chain_from_list(slots, ch)
+            if chain is not None:
+                self._midi_fx_chains[ch] = chain
+
+        # ── Restore automation envelopes ──────────────────────────────────────
+        ProjectManager.restore_automation_lanes(
+            doc, self._audio_fx_chains, self._midi_fx_chains)
+
+        # ── Restore channel rack rows ──────────────────────────────────────────
+        rack_rows = ProjectManager.restore_channel_rack(doc)
+        if rack_rows:
+            self._channel_rack.set_rows(rack_rows)
+            self._midi.set_step_rows(rack_rows)
+
+        # ── Refresh UI ────────────────────────────────────────────────────────
+        self._refresh_piano_roll()
+        self._arrange_view.set_audio_tracks(self._midi.get_audio_tracks())
+        self._st_engine.setText(f"Loaded: {os.path.basename(path)}")
+        QMessageBox.information(self, "Load Project",
+                                f"Project loaded:\n{path}")
+
+    # ------------------------------------------------------------------
+    # Automation lane handlers
+    # ------------------------------------------------------------------
+
+    @Slot(int, str)
+    def _on_automation_toggled(self, track_id: int, kind: str) -> None:
+        """
+        Toggle the AutomationLane for a track in the AutomationPanel.
+        kind = "midi" (uses MIDI FX chain) or "audio" (uses audio FX chain).
+        """
+        if self._auto_panel.has_lane(track_id):
+            # Lane already open: close it
+            self._auto_panel.remove_lane(track_id)
+            # Collapse the splitter when no lanes remain
+            if not self._auto_panel.isVisible():
+                self._arrange_splitter.setSizes([600, 0])
+        else:
+            # Determine the chain and display name for this track
+            if kind == "midi":
+                chain = self._midi_fx_chains.get(track_id)
+                if chain is None:
+                    chain = AudioFxChain(track_id=track_id)
+                    self._midi_fx_chains[track_id] = chain
+                track = self._midi.get_track(track_id)
+                name  = track.name if track else f"CH {track_id + 1:02d}"
+                color_idx = track_id % len(C["tracks"])
+                color = C["tracks"][color_idx]
+            else:
+                chain = self._audio_fx_chains.get(track_id)
+                if chain is None:
+                    chain = AudioFxChain(track_id=track_id)
+                    self._audio_fx_chains[track_id] = chain
+                atrack = self._midi.get_audio_track(track_id)
+                name   = atrack.name if atrack else f"Audio {track_id}"
+                color  = atrack.color if atrack else C["gold"]
+
+            self._auto_panel.add_lane(track_id, chain, name, color)
+            # Expand splitter to show the panel (about 3 lane heights)
+            lane_h = 3 * 72 + 4
+            total  = self._arrange_splitter.height()
+            self._arrange_splitter.setSizes(
+                [max(100, total - lane_h), lane_h])
+
+    # ------------------------------------------------------------------
+    # Channel Rack / Step Sequencer handlers
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _on_toggle_channel_rack(self) -> None:
+        """Show or hide the Channel Rack window.
+
+        On the very first call the window is positioned below the main window
+        so it is immediately visible without the user having to hunt for it.
+        """
+        if self._channel_rack.isVisible():
+            self._channel_rack.hide()
+        else:
+            # Centre the rack below the main window on first show.
+            # After that, let the OS remember the user's preferred position.
+            if not self._channel_rack.isVisible() and \
+                    self._channel_rack.pos().isNull():
+                mw_geo   = self.frameGeometry()
+                rack_w   = self._channel_rack.width()
+                rack_x   = mw_geo.x() + (mw_geo.width() - rack_w) // 2
+                rack_y   = mw_geo.y() + mw_geo.height() + 8   # just below main window
+                self._channel_rack.move(max(0, rack_x), max(0, rack_y))
+            self._channel_rack.show()
+            self._channel_rack.raise_()
+            self._channel_rack.activateWindow()
+
+    @Slot(int, int, int)
+    def _on_rack_note_on(self, row_id: int, note: int, velocity: int) -> None:
+        """Fire a note for a channel rack row.
+
+        If the row has an audio sample loaded, the RackSamplerEngine handles
+        playback (pitched WAV).  Otherwise fall back to FluidSynth on the row's
+        original MIDI channel (typically channel 9 for drums).
+        """
+        if self._rack_engine.has_sample(row_id):
+            self._rack_engine.note_on(row_id, note, velocity)
+        else:
+            fluid_ch = self._rack_row_fluid_ch.get(row_id, 9)
+            self._note_event_callback(fluid_ch, note, velocity, True)
+
+    @Slot(int, int)
+    def _on_rack_note_off(self, row_id: int, note: int) -> None:
+        """Release a note for a channel rack row."""
+        if self._rack_engine.has_sample(row_id):
+            self._rack_engine.note_off(row_id, note)
+        else:
+            fluid_ch = self._rack_row_fluid_ch.get(row_id, 9)
+            self._note_event_callback(fluid_ch, note, 0, False)
+
+    @Slot(int, str)
+    def _on_rack_sample_loaded(self, row_id: int, path: str) -> None:
+        """Load an audio sample for a rack row into the RackSamplerEngine."""
+        ok = self._rack_engine.load_sample(row_id, path)
+        if ok:
+            root_note = self._rack_row_note.get(row_id, 60)
+            self._rack_engine.set_root_note(row_id, root_note)
+            self._st_engine.setText(f"Rack row {row_id}: sample loaded")
+        else:
+            self._st_engine.setText(f"Rack row {row_id}: failed to load sample")
+
+    @Slot(list)
+    def _on_rack_copy_to_timeline(self, rows: list) -> None:
+        """
+        Convert the current 1-bar step pattern to a MidiClip placed at the
+        current playhead position on each active channel.
+
+        One timeline track is created per rack row (keyed by MIDI channel).
+        If the track already exists it is reused.  New tracks get a full
+        MixerStrip + EffectChain so they are immediately audible.
+        """
+        if not rows:
+            return
+
+        STEP_DUR  = 0.25   # One 16th note in beats
+        NOTE_DUR  = STEP_DUR * 0.8  # Note-off slightly before the next step
+
+        start_beat  = self._midi.playhead_beat
+        clips_added = 0
+
+        from .midi_logic import MidiTrack, MidiClip, MidiNote
+
+        for row in rows:
+            if not row.enabled:
+                continue
+            # Collect only active (enabled) steps.
+            # Notes use row.row_id as channel so _note_event_callback routes
+            # them back through RackSamplerEngine (or FluidSynth fallback).
+            active_notes = []
+            for i, active in enumerate(row.steps[:16]):
+                if active:
+                    active_notes.append((i * STEP_DUR, NOTE_DUR,
+                                         row.note, row.velocity, row.row_id))
+            if not active_notes:
+                continue
+
+            # Get or create a fully-wired MidiTrack for this row.
+            # Use row.row_id as the timeline track channel so each rack row
+            # gets its own separate track even when sharing a MIDI channel.
+            track = self._midi.get_track(row.row_id)
+            if track is None:
+                color_idx = row.row_id % len(C["tracks"])
+                track = MidiTrack(
+                    name=row.name,
+                    channel=row.row_id,    # unique per row
+                    color=C["tracks"][color_idx],
+                )
+                # Register with MIDI logic AND create MixerStrip + EffectChain
+                # so the track is audible immediately (same path as add_track).
+                self._midi.add_track(track)
+                self._effect_chains[row.row_id] = EffectChain(channel=row.row_id)
+                self._engine.apply_effect_chain(self._effect_chains[row.row_id])
+
+                strip = MixerStrip(row.row_id, row.name, track.color)
+                strip.gain_changed  .connect(self._engine.set_gain)
+                strip.pan_changed   .connect(self._engine.set_pan)
+                strip.mute_toggled  .connect(self._engine.set_mute)
+                strip.solo_toggled  .connect(self._engine.set_solo)
+                strip.track_selected.connect(self._on_track_selected)
+                strip.remove_clicked.connect(self._on_remove_track)
+                strip.name_changed  .connect(self._on_track_renamed)
+                self._mixer_strips[row.row_id] = strip
+                self._mixer_layout.addWidget(strip)
+
+            # Build the one-bar clip and populate it with notes.
+            clip = MidiClip(
+                start_beat=start_beat,
+                duration=4.0,
+                name=f"Rack: {row.name}",
+                color=track.color,
+                clip_id=self._midi._next_id(),
+            )
+            for rel_beat, dur, pitch, vel, ch in active_notes:
+                clip.notes.append(MidiNote(
+                    start_beat=rel_beat,
+                    duration=dur,
+                    pitch=pitch,
+                    velocity=vel,
+                    channel=ch,
+                    note_id=self._midi._next_id(),
+                ))
+            track.clips.append(clip)
+            row.on_timeline = True
+            clips_added += 1
+
+        self._refresh_piano_roll()
+
+        if clips_added:
+            self._st_engine.setText(
+                f"Rack: {clips_added} clip(s) added to timeline at beat {start_beat:.2f}")
+        else:
+            self._st_engine.setText(
+                "Nothing to copy — activate some steps in the channel rack first")
+
     @Slot()
     def _on_save_midi(self) -> None:
+        # Guard: check mido is available before opening the file dialog so
+        # the user gets a clear actionable message rather than a silent failure.
+        try:
+            import mido  # noqa: F401
+        except ImportError:
+            QMessageBox.critical(
+                self, "Save MIDI",
+                "The 'mido' library is not installed.\n\n"
+                "Install it with:  pip install mido")
+            return
+
         if not self._midi.get_all_tracks():
             QMessageBox.information(self, "Save MIDI",
-                "No tracks to save. Add tracks and draw notes first.")
+                "No tracks to save.\n\nAdd a MIDI track and draw some notes first.")
             return
+
         path, _ = QFileDialog.getSaveFileName(
             self, "Save MIDI File",
             os.path.expanduser("~/Untitled.mid"),
@@ -4819,11 +6151,15 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+
         ok = self._midi.export_to_midi_file(path)
         if ok:
+            self._st_engine.setText(f"MIDI saved: {os.path.basename(path)}")
             QMessageBox.information(self, "Save MIDI", f"Saved:\n{path}")
         else:
-            QMessageBox.critical(self, "Save MIDI", "Export failed.")
+            QMessageBox.critical(
+                self, "Save MIDI",
+                "Export failed — check the console for details.")
 
     @Slot()
     def _on_open_midi(self) -> None:
@@ -4898,80 +6234,227 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_export(self) -> None:
-        import subprocess, tempfile
+        """
+        Export the full project (MIDI instrument tracks + audio file tracks)
+        to a single stereo audio file.
 
-        if not self._midi.get_all_tracks():
-            QMessageBox.information(self, "Export", "Add tracks first.")
+        Rendering pipeline:
+            MIDI tracks   → pyfluidsynth offline API  → float32 PCM
+            Audio tracks  → pedalboard AudioFile       → float32 PCM
+            Both paths    → C++ OfflineExporter mix bus → WAV on disk
+            Optional      → ffmpeg                     → MP3 or AAC
+        """
+        midi_tracks  = self._midi.get_all_tracks()
+        audio_tracks = self._midi.get_audio_tracks()
+        step_rows    = self._midi.get_step_rows()
+
+        if not midi_tracks and not audio_tracks and not step_rows:
+            QMessageBox.information(
+                self, "Export",
+                "Nothing to export.\n\n"
+                "Add a MIDI track or import an audio file first.")
             return
 
         dlg = ExportDialog(self)
         if dlg.exec() != QDialog.Accepted:
             return
 
-        out_path = dlg.result_path().strip()
-        fmt = dlg.result_format()
-        base = os.path.splitext(out_path)[0]
+        out_path  = dlg.result_path().strip()
+        fmt       = dlg.result_format()
+        bpm       = self._midi.bpm
 
-        sf2_files = AudioEngine.get_available_sf2_files()
-        if not sf2_files:
-            QMessageBox.critical(self, "Export", "No SoundFont found — cannot render audio.")
+        # 32-bit float for WAV archiving; 24-bit broadcast standard otherwise.
+        bit_depth = 32 if fmt == "wav" else 24
+
+        # Calculate project end beat so step-sequencer events cover the full
+        # duration without extending past it.
+        end_beat = 0.0
+        for track in midi_tracks:
+            for note in track.sorted_notes():
+                end_beat = max(end_beat, note.start_beat + note.duration)
+        for atrack in audio_tracks:
+            for clip in atrack.clips:
+                end_beat = max(end_beat, clip.start_beat + clip.duration_seconds * bpm / 60.0)
+        end_beat = max(end_beat + 1.0, 8.0)
+
+        step_events = self._midi._build_step_events(0.0, end_beat) if step_rows else []
+
+        # ── Progress dialog ───────────────────────────────────────────────────
+        prog = QProgressDialog("Preparing export…", "Cancel", 0, 100, self)
+        prog.setWindowTitle("Exporting Project")
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+
+        # ── Launch worker thread ──────────────────────────────────────────────
+        worker = ExportWorker(
+            out_path=out_path,
+            fmt=fmt,
+            audio_tracks=audio_tracks,
+            midi_tracks=midi_tracks,
+            instruments=self._engine.get_instruments_by_channel(),
+            audio_fx_chains=self._audio_fx_chains,
+            bpm=bpm,
+            bit_depth=bit_depth,
+            step_events=step_events,
+            midi_fx_chains=self._midi_fx_chains,
+            parent=self,
+        )
+
+        worker.progress.connect(prog.setValue)
+        worker.log_msg.connect(prog.setLabelText)
+        worker.finished.connect(prog.close)
+        prog.canceled.connect(worker.requestInterruption)
+
+        def _on_done(ok: bool) -> None:
+            if ok:
+                QMessageBox.information(
+                    self, "Export Complete", f"Saved:\n{out_path}")
+                self._st_engine.setText(
+                    f"Exported: {os.path.basename(out_path)}")
+            else:
+                QMessageBox.critical(
+                    self, "Export Failed",
+                    "Export encountered an error.\n"
+                    "Check the log or the progress dialog for details.")
+
+        worker.finished.connect(_on_done)
+
+        # Keep a reference so the thread is not garbage-collected mid-run.
+        self._export_worker = worker
+        worker.start()
+
+    @Slot()
+    def _on_master_export(self) -> None:
+        """
+        Snapshot the entire live project into a FullProjectRenderInfo and
+        open the multi-format mastering export dialog.
+
+        Nothing from the GUI is passed to the worker thread — only immutable
+        Python data that was copied here on the GUI thread.
+        """
+        bpm = self._midi.bpm
+        spb = 60.0 / max(1.0, bpm)   # seconds per beat
+
+        instruments = self._engine.get_instruments_by_channel()
+        max_beat    = 0.0             # tracks the latest event in beats
+
+        # ── Helper: convert one AudioFxChain's envelopes to AutomationRenderInfo ──
+        def _collect_automation(fx_chain) -> list:
+            if fx_chain is None:
+                return []
+            result = []
+            for key, env in list(fx_chain.envelopes.items()):
+                if not getattr(env, "nodes", None):
+                    continue
+                pts = [
+                    (n.beat_pos * spb, env.evaluate(n.beat_pos))
+                    for n in sorted(env.nodes, key=lambda x: x.beat_pos)
+                ]
+                result.append(AutomationRenderInfo(target_key=key, points=pts))
+            return result
+
+        # ── MIDI tracks ───────────────────────────────────────────────────────
+        midi_tracks: list = []
+        for mtrack in self._midi.get_all_tracks():
+            notes = list(mtrack.notes)
+            if not notes:
+                continue
+            plugin = instruments.get(mtrack.channel)
+            if plugin is None or not plugin.sf2_path:
+                continue   # can't synthesise without a soundfont
+
+            # Update project duration estimate.
+            for note in notes:
+                max_beat = max(max_beat, note.start_beat + note.duration)
+
+            # Live mixer-strip values take priority; fall back to plugin defaults.
+            strip  = self._mixer_strips.get(mtrack.channel)
+            volume = (strip.vol.value() / 100.0) if strip else plugin.gain
+            pan    = (strip.pan.value() / 50.0)  if strip else plugin.pan
+
+            fx_chain = self._midi_fx_chains.get(mtrack.channel)
+
+            midi_tracks.append(MidiTrackRenderInfo(
+                name       = mtrack.name or f"Track {mtrack.channel}",
+                channel    = mtrack.channel,
+                notes      = notes,
+                sf2_path   = plugin.sf2_path,
+                bank       = plugin.bank,
+                preset     = plugin.preset,
+                volume     = volume,
+                pan        = pan,
+                automation = _collect_automation(fx_chain),
+                fx_chain   = fx_chain,
+            ))
+
+        # ── Audio tracks ──────────────────────────────────────────────────────
+        audio_track_infos: list = []
+        for atrack in self._midi.get_audio_tracks():
+            for clip in atrack.clips:
+                max_beat = max(
+                    max_beat,
+                    clip.start_beat + clip.duration_seconds / spb,
+                )
+
+            strip  = self._audio_mixer_strips.get(atrack.track_id)
+            volume = (strip.vol.value() / 100.0) if strip else 1.0
+            pan    = (strip.pan.value() / 50.0)  if strip else 0.0
+
+            fx_chain = self._audio_fx_chains.get(atrack.track_id)
+
+            audio_track_infos.append(TrackRenderInfo(
+                track_id   = atrack.track_id,
+                name       = atrack.name,
+                clips      = list(atrack.clips),
+                fx_chain   = fx_chain,
+                volume     = volume,
+                pan        = pan,
+                automation = _collect_automation(fx_chain),
+            ))
+
+        # ── Step sequencer events ─────────────────────────────────────────────
+        # Use at least 8 bars so short patterns loop enough times to be audible.
+        step_end_beat = max(max_beat + 4.0, 8.0)
+        step_events   = self._midi._build_step_events(0.0, step_end_beat)
+
+        # ── Guard: nothing to render ──────────────────────────────────────────
+        if not midi_tracks and not audio_track_infos and not step_events:
+            QMessageBox.information(
+                self, "Master Export",
+                "Nothing to export.\n\n"
+                "Add MIDI tracks with instruments, audio clips, or step-sequencer "
+                "patterns before using the mastering export.")
             return
 
-        with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as f:
-            tmp_midi = f.name
+        # ── Build immutable project snapshot ──────────────────────────────────
+        render_info = FullProjectRenderInfo(
+            midi_tracks  = midi_tracks,
+            audio_tracks = audio_track_infos,
+            step_events  = step_events,
+            bpm          = bpm,
+            sample_rate  = 44100,
+        )
 
-        try:
-            instruments = {p.channel: (p.bank, p.preset) for p in self._engine.get_instruments()}
-            self._midi.export_to_midi_file(tmp_midi, instruments=instruments)
+        # ── Default output directory / project name ───────────────────────────
+        last_export  = getattr(self, "_last_export_path", "")
+        default_dir  = (
+            os.path.dirname(last_export)
+            if last_export and os.path.isdir(os.path.dirname(last_export))
+            else os.path.expanduser("~")
+        )
+        default_name = (
+            os.path.splitext(os.path.basename(last_export))[0]
+            if last_export else "project"
+        )
 
-            # For AAC we render to a temp WAV first, then encode.
-            wav_path = base + ".wav" if fmt == "wav" else base + "_tmp_export.wav"
-            ok = self._engine.export_to_wav(wav_path, tmp_midi, sf2_files[0])
-        finally:
-            os.unlink(tmp_midi)
-
-        if not ok:
-            QMessageBox.critical(self, "Export", "WAV render failed — check the log for details.")
-            return
-
-        if fmt == "mp3":
-            out = base + ".mp3"
-            ffmpeg = next(
-                (p for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg",
-                              __import__("shutil").which("ffmpeg")]
-                 if p and os.path.isfile(p)), None
-            )
-            if not ffmpeg:
-                QMessageBox.critical(self, "Export",
-                    "ffmpeg not found.\n\nInstall it with:\n"
-                    "  /opt/homebrew/bin/brew install ffmpeg")
-                return
-            try:
-                subprocess.run(
-                    [ffmpeg, "-y", "-i", wav_path, "-b:a", "192k", out],
-                    check=True, capture_output=True,
-                )
-                os.unlink(wav_path)
-                QMessageBox.information(self, "Export", f"Saved: {out}")
-            except subprocess.CalledProcessError as exc:
-                err = exc.stderr.decode(errors="replace") if exc.stderr else "(no output)"
-                QMessageBox.critical(self, "Export", f"ffmpeg failed:\n{err}")
-        elif fmt == "aac":
-            out = base + ".m4a"
-            try:
-                # afconvert ships with every macOS install — no external tools needed.
-                subprocess.run(
-                    ["afconvert", "-f", "m4af", "-d", "aac", "-b", "192000",
-                     wav_path, out],
-                    check=True, capture_output=True,
-                )
-                os.unlink(wav_path)
-                QMessageBox.information(self, "Export", f"Saved: {out}")
-            except subprocess.CalledProcessError as exc:
-                err = exc.stderr.decode(errors="replace") if exc.stderr else "(no output)"
-                QMessageBox.critical(self, "Export", f"afconvert failed:\n{err}")
-        else:
-            QMessageBox.information(self, "Export", f"Saved: {wav_path}")
+        dlg = MasterExportDialog(
+            render_info  = render_info,
+            output_dir   = default_dir,
+            project_name = default_name,
+            parent       = self,
+        )
+        dlg.exec()
 
     @Slot()
     def _on_scale_changed(self) -> None:
@@ -5157,19 +6640,108 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_refresh_tick(self) -> None:
+        # Push the current playhead beat to both views so they can draw the
+        # moving playhead line.  This runs at ~20 Hz (50 ms interval) which
+        # gives smooth visual motion without taxing the render thread.
+        beat = self._midi.playhead_beat
+        self._piano_roll.set_playhead_beat(beat)
+        self._arrange_view.set_playhead_beat(beat)
         if self._midi.is_playing:
-            self._st_beat.setText(f"♩ {self._midi.playhead_beat:.2f}")
-            self._piano_roll.update()
+            self._st_beat.setText(f"♩ {beat:.2f}")
+            # Apply automation envelopes to all audio FX chains, then
+            # immediately propagate the new volume/pan to the active playback
+            # engine so the change is audible without waiting for the next
+            # clip-start event.
+            for tid, chain in self._audio_fx_chains.items():
+                if chain.envelopes:
+                    chain.apply_automation(beat)
+                    # Path 1: pygame fallback — update the mixer channel
+                    # volume.  _apply_channel_volume reads chain.volume which
+                    # apply_automation just wrote, so no extra state is needed.
+                    self._audio_player.set_volume(tid, chain.volume)
+                    # Path 2: C++ sounddevice engine — push volume and pan to
+                    # the TimelineEngine so the block-level gain is updated
+                    # before the next process_block_into() call.
+                    if self._timeline_bridge.is_available:
+                        self._timeline_bridge.set_audio_track_volume(tid, chain.volume)
+                        self._timeline_bridge.set_audio_track_pan(tid, chain.pan)
+            # MIDI FX chains: apply automation and push the result to FluidSynth
+            # via CC7 (volume) and CC10 (pan) so the change is audible immediately.
+            for channel, chain in self._midi_fx_chains.items():
+                if chain.envelopes:
+                    chain.apply_automation(beat)
+                    self._engine.set_gain(channel, min(1.0, chain.volume))
+                    self._engine.set_pan(channel, chain.pan)
+        # Always update the channel rack scanning light (even when paused).
+        self._channel_rack.set_playhead_beat(beat)
+
+        # If any background waveform load finished since the last tick,
+        # repaint the arrange view so the newly computed peaks appear.
+        if self._waveform_gen.poll():
             self._arrange_view.update()
 
     def _note_event_callback(self, channel: int, pitch: int, velocity: int, is_on: bool) -> None:
-        # AudioEngine.note_on/off already handles VST routing via _vst_players,
-        # so one unified path works for both VST and FluidSynth channels.
-        if is_on:
-            chain = self._effect_chains.get(channel)
-            self._engine.note_on_with_effects(channel, pitch, velocity, chain)
-        else:
-            self._engine.note_off(channel, pitch)
+        # ── Path 0: Rack-sampler engine (row_id channels ≥ 32) ──────────────
+        # Timeline clips copied from the channel rack use channel = row_id (≥32).
+        # Route them to the RackSamplerEngine if a sample is loaded; otherwise
+        # fall back to the row's real MIDI channel for FluidSynth.
+        if channel >= 32:
+            if self._rack_engine.has_sample(channel):
+                if is_on:
+                    self._rack_engine.note_on(channel, pitch, velocity)
+                else:
+                    self._rack_engine.note_off(channel, pitch)
+            else:
+                fluid_ch = self._rack_row_fluid_ch.get(channel, 9)
+                self._note_event_callback(fluid_ch, pitch, velocity, is_on)
+            return
+
+        # ── Path 1: Velocity humanization ────────────────────────────────────
+        # Apply Gaussian + timing-weight humanization when the user has enabled
+        # it for this channel.  Only modifies note-on velocity (note-off = 0).
+        humanizer = self._midi_humanizers.get(channel)
+        if is_on and humanizer is not None and velocity > 0:
+            beat = self._midi.playhead_beat
+            velocity = humanizer.humanize(velocity, beat)
+
+        # ── Path 2: Instrument plugins in MIDI-track FX chains ──────────────
+        # Check whether any plugin in the chain is an active instrument (e.g. a
+        # SamplerPlugin with a file loaded).  If so, the plugin handles audio
+        # synthesis on its own — FluidSynth must be skipped to prevent the
+        # instrument and the soundfont from sounding simultaneously.
+        midi_chain = self._midi_fx_chains.get(channel)
+        chain_has_instrument = False
+        if midi_chain is not None:
+            vel_float = velocity / 127.0
+            for plugin in list(midi_chain.plugins):
+                if plugin is None:
+                    continue
+                # Detect active instrument plugins via the is_instrument_active()
+                # contract defined on FxPluginBase (default False for pure FX).
+                if plugin.is_instrument_active():
+                    chain_has_instrument = True
+                # Skip bypassed plugins entirely — no note events, no audio.
+                # This lets FluidSynth take over when the user deactivates the slot.
+                if not plugin.enabled:
+                    continue
+                try:
+                    if is_on and hasattr(plugin, "note_on"):
+                        plugin.note_on(int(pitch), float(vel_float))
+                    elif not is_on and hasattr(plugin, "note_off"):
+                        plugin.note_off(int(pitch))
+                except Exception:
+                    pass  # never crash the playback thread on a plugin error
+
+        # ── Path 2: FluidSynth / VST synthesis ──────────────────────────────
+        # Skipped when an instrument plugin above already claimed the channel.
+        # AudioEngine.note_on/off handles VST routing via _vst_players and
+        # FluidSynth CC-based effects via _effect_chains.
+        if not chain_has_instrument:
+            if is_on:
+                chain = self._effect_chains.get(channel)
+                self._engine.note_on_with_effects(channel, pitch, velocity, chain)
+            else:
+                self._engine.note_off(channel, pitch)
 
     # ------------------------------------------------------------------
     # Qt overrides
@@ -5218,4 +6790,7 @@ class MainWindow(QMainWindow):
         self._midi.stop()
         self._controller.stop_gamepad_polling()
         self._engine.stop()
+        self._rack_engine.stop()
+        if self._timeline_bridge is not None:
+            self._timeline_bridge.close_stream()
         ev.accept()
