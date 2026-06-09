@@ -74,6 +74,11 @@
 
 namespace py = pybind11;
 
+// Forward declarations for the split binding modules.
+void bind_sfz            (py::module_& m);
+void bind_vst3_extensions(py::module_& m);
+void bind_ds             (py::module_& m);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Generic process_block wrapper
 // Returns a pair of new numpy arrays containing the processed audio so the
@@ -1712,4 +1717,14 @@ PYBIND11_MODULE(daw_processors, m) {
         .def("get_audition_mode",
              &MasterBus::get_audition_mode,
              "Return the current audition mode as an integer.");
+
+    // ── SFZ instrument engine (SfzParser + SfizzEngine) ──────────────────────
+    bind_sfz(m);
+
+    // ── VST3 advanced hosting extensions ─────────────────────────────────────
+    // (compiled as stubs when HAVE_VST3_SDK is not defined)
+    bind_vst3_extensions(m);
+
+    // ── Decent Sampler engine + VST3 bus manager ─────────────────────────────
+    bind_ds(m);
 }

@@ -2,6 +2,8 @@
 
 A full-featured Digital Audio Workstation built with a **C++ audio core** and a **PySide6 GUI layer**. MIDI sequencing, multi-track mixing, a timeline arranger, a step sequencer, a channel rack, per-track C++ DSP effects, full-project offline mastering export, a real-time master bus with audition modes, AI-assisted tools, and live keyboard / gamepad input — all in one application.
 
+Four instrument backends are supported simultaneously on separate MIDI channels: **SF2 SoundFont**, **SFZ**, **Decent Sampler (.dspreset)**, and **VST3 / Audio Unit** plugins.
+
 ---
 
 ## Screenshots
@@ -20,26 +22,30 @@ A full-featured Digital Audio Workstation built with a **C++ audio core** and a 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                   PySide6 GUI Layer                     │
-│  MainWindow · PianoRoll · Mixer · Transport · Panels    │
-└────────────────────────┬────────────────────────────────┘
-                         │  pybind11 bindings
-┌────────────────────────▼────────────────────────────────┐
-│              C++ daw_processors Extension               │
-│  MasterBus · AuditionProcessor · BrickwallLimiter       │
-│  AutomationProcessor · FullProjectRenderer · Sampler    │
-│  40+ DSP processors (compressor, EQ, reverb, …)         │
-└────────────────────────┬────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────┐
-│           FluidSynth / pygame / pedalboard              │
-│       SoundFont synthesis · pygame audio output         │
-│           pedalboard FX chains · VST hosting            │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                       PySide6 GUI Layer                         │
+│  MainWindow · PianoRoll · Mixer · Transport · DsPresetPanel     │
+│  InstrumentSelectorDialog (SF2 / SFZ / VST3 / DS tabs)         │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │  pybind11 bindings (GIL released)
+┌──────────────────────────▼──────────────────────────────────────┐
+│                 C++ daw_processors Extension                     │
+│  DecentSamplerEngine · SfizzEngine · SfzParser                  │
+│  Vst3BusManager · Vst3StateManager · Vst3AutomationQueue        │
+│  Vst3TransportContext · MasterBus · AuditionProcessor           │
+│  BrickwallLimiter · AutomationProcessor · FullProjectRenderer   │
+│  40+ DSP processors (compressor, EQ, reverb, …)                 │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │  MIDI routing priority chain
+┌──────────────────────────▼──────────────────────────────────────┐
+│             Instrument Backend Layer (per MIDI channel)         │
+│  VST → SFZ (sfizz) → DS (DecentSampler) → SF2 (FluidSynth)    │
+│  sounddevice real-time streams · pygame audio fallback          │
+│  pedalboard VST3 / AU hosting                                   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**Design rule:** all audio processing and DSP run in C++ (GIL released via `py::call_guard<py::gil_scoped_release>()`). Python is strictly the GUI and orchestration layer.
+**Design rule:** all audio processing and DSP run in C++ (GIL released via `py::call_guard<py::gil_scoped_release>()`). Python is strictly the GUI and orchestration layer — no audio buffers, no ADSR, no WAV decoding in Python.
 
 ---
 
@@ -49,7 +55,7 @@ A full-featured Digital Audio Workstation built with a **C++ audio core** and a 
 
 | Feature | Description |
 |---|---|
-| **Multi-Track MIDI** | Up to 16 instrument channels, each with its own SoundFont patch, volume, pan, reverb, mute, and solo |
+| **Multi-Track MIDI** | Up to 16 instrument channels, each with its own instrument backend, volume, pan, reverb, mute, and solo |
 | **Piano Roll** | Click-and-drag to draw notes; right-click to erase; scroll to navigate; active track vivid, others shown as ghost notes |
 | **Velocity Editor** | Per-note velocity bars rendered below the piano roll; chord notes shown side-by-side with pitch labels |
 | **Live Recording** | Play keys in real time and capture notes with beat-accurate timing |
@@ -57,6 +63,71 @@ A full-featured Digital Audio Workstation built with a **C++ audio core** and a 
 | **Clip-Based Arrangement** | MIDI and audio clips placed on a scrollable timeline; drag to reposition, right-click to delete |
 | **Grid Snap** | Configurable quantise grid (1/4, 1/8, 1/16, 1/32 note, triplets); visual grid lines in the arrange view |
 | **Velocity Humanizer** | Gaussian-distributed velocity and timing micro-variation for natural-sounding playback (C++ `VelocityHumanizer`) |
+
+### Instrument Backends
+
+All four backends can be active at the same time on different MIDI channels. The `AudioEngine` routing chain checks VST → SFZ → DS → SF2 per channel.
+
+#### SF2 — General MIDI SoundFont
+
+| Feature | Description |
+|---|---|
+| **FluidSynth synthesis** | Full General MIDI (128 patches + drums) rendered by FluidSynth in its own audio thread |
+| **SoundFont browser** | Category → patch list with live preview keyboard; supports multiple `.sf2` files |
+| **GM Instrument catalogue** | All 128 GM patches grouped by family (Piano, Strings, Brass, Synth, …); drums on CH 9 |
+| **Per-channel FX** | FluidSynth reverb, chorus, gain, and pan applied per channel from the mixer strip |
+
+#### SFZ — Open Sampler Format
+
+| Feature | Description |
+|---|---|
+| **C++ SfizzEngine** | Wraps the *sfizz* library for full SFZ v1 / most SFZ v2 opcode support |
+| **SIMD-accelerated DSP** | sfizz provides disk-streaming, multi-velocity layers, round-robin cycling, and SIMD mixing |
+| **Real-time audio stream** | `SfzRealTimePlayer` opens a *sounddevice* `OutputStream`; audio rendered in the C++ callback with the GIL released |
+| **Key-range visualiser** | `SfzKeyRangeWidget` displays sample zones on a colour-coded keyboard graphic |
+| **Region inspector** | Scrollable table listing every SFZ region: key range, velocity range, sample path |
+| **Python fallback** | `SfizzEnginePython` uses *pygame.mixer* for root-pitch-only playback when the C++ extension is absent |
+
+#### DS — Decent Sampler (.dspreset)
+
+| Feature | Description |
+|---|---|
+| **C++ DecentSamplerEngine** | Hand-rolled WAV decoder (PCM 16-bit, 24-bit, IEEE float32) + polyphonic voice pool |
+| **ADSR envelopes** | Per-voice linear attack/decay/sustain/release in C++; configurable per zone from the preset XML |
+| **Pitch-shift** | Playback-rate scaling — `rate = 2^((note − root_note) / 12)` — with linear interpolation between frames |
+| **Round-robin sequencing** | C++ `seq_position`/`seq_length` counters per zone group; correct RR zone selected each note-on |
+| **Sample looping** | Loop start/end frame with sub-sample accurate wrap-around for sustain loops |
+| **Dynamic GUI panel** | `DsPresetPanel` (dock widget) builds native Qt knobs, sliders, and buttons from the `<ui>` block in the XML; auto-updates on load |
+| **XML parser** | `dspreset_parser.py` reads the `.dspreset` format into `DsInstrumentInfo` / `DsZoneData` dataclasses — no audio code in Python |
+| **MIDI CC automation** | Knobs and sliders declared with a `cc=` attribute in the preset are automatically bound; `apply_cc()` remaps 0–127 to the control's native range |
+| **Real-time player** | `DsRealTimePlayer` mirrors `SfzRealTimePlayer`; opens a *sounddevice* stream and feeds the C++ engine's `render()` from the audio callback |
+| **Python fallback** | `DsEnginePython` uses *pygame.mixer* for root-pitch-only playback; no pitch shifting in the fallback path |
+
+#### VST3 / Audio Unit
+
+| Feature | Description |
+|---|---|
+| **Plugin hosting** | *pedalboard* library loads VST3 (Windows/macOS/Linux) and Audio Unit (macOS) plugins |
+| **Real-time audio** | `VstRealTimePlayer` opens a *sounddevice* stream and processes MIDI through the plugin in the audio callback |
+| **Plugin browser** | Auto-scans standard system plugin directories; manual file picker as fallback |
+| **Multi-bus routing** | C++ `Vst3BusManager` queries `IComponent::getBusCount()` / `getBusInfo()` for the full bus topology; activates buses via `IComponent::activateBus()` |
+| **State save/restore** | C++ `Vst3StateManager` serialises `IComponent` + `IEditController` state to bytes for project files |
+| **Sample-accurate automation** | C++ `Vst3AutomationQueue` implements `IParameterChanges` / `IParamValueQueue`; `Vst3AutomationCurve` maps beat positions to per-block sample offsets |
+| **Transport sync** | C++ `Vst3TransportContext` maintains a `ProcessContext` with tempo, time signature, and sample position; updated once per block |
+| **Python bridges** | `vst3_host_extensions.py` wraps state/automation/transport; `vst3_bus_manager.py` wraps bus topology — all degrade to no-op stubs without the VST3 SDK |
+
+### Instrument Selector Dialog
+
+The unified **"Change Instrument"** dialog (`InstrumentSelectorDialog`) has four tabs, each colour-coded:
+
+| Tab | Colour | Backend |
+|---|---|---|
+| SF2  SOUNDFONT | Cyan | FluidSynth + .sf2 file |
+| SFZ  INSTRUMENT | Lime green | sfizz C++ engine + .sfz file |
+| VST3  PLUGIN | Purple | pedalboard + .vst3 / .component file |
+| DS  DECENT SAMPLER | Gold | DecentSamplerEngine + .dspreset file |
+
+The dialog is opened from the mixer strip "Change Instrument" button or from the `Add Instrument Track` workflow.
 
 ### Audio Tracks & Import
 
@@ -101,12 +172,14 @@ All processors compiled as a single `daw_processors` pybind11 extension; every `
 | **Harmonic / Character** | Saturation · Overdrive · Bitcrusher · Exciter |
 | **Filter / Pitch** | AutoFilter · PitchCorrector · PitchShifter |
 | **Sampler** | Sampler (offline wavetable, polyphonic) |
+| **Instrument Engines** | DecentSamplerEngine · SfizzEngine (sfizz wrapper) |
 | **Metering / Analysis** | RmsAnalyzer · SpectralAnalyzer · EnvelopeFollower · WaveformGenerator |
 | **Loudness** | LoudnessAutomation (RMS + PID) |
 | **Panning** | SpectralPanningProcessor · SpectralMaskingManager |
 | **Grid / Timing** | GridSnapper · QuantizeEngine · TimelineRuler · AudioLoopScheduler |
 | **Humanization** | VelocityHumanizer · GaussianRng · TimingWeightFunction |
 | **Render Pipeline** | AutomationProcessor · FullProjectRenderer · OfflineExporter · MasterBus · AuditionProcessor |
+| **VST3 Hosting** | Vst3BusManager · Vst3StateManager · Vst3AutomationQueue · Vst3TransportContext |
 
 Pure-Python fallbacks (matching the same API) are provided for every C++ class so the application runs without a compiled extension.
 
@@ -157,6 +230,7 @@ Pure-Python fallbacks (matching the same API) are provided for every C++ class s
 | Feature | Description |
 |---|---|
 | **Bioluminescent Dark Theme** | Deep-black backgrounds with glowing cyan and hot-pink neon accents; consistent across all panels |
+| **DS Preset Panel** | Dynamic dock widget that reads the `<ui>` block of a `.dspreset` file and builds native Qt knobs/sliders/buttons; supports MIDI CC automation |
 | **Humanizer Panel** | GUI for the C++ `VelocityHumanizer`; per-track Gaussian spread and timing jitter controls |
 | **Grid Settings Panel** | Visual grid resolution picker with live preview |
 | **Instrument Preview** | Audition any GM patch before assigning it to a track |
@@ -175,7 +249,7 @@ Pure-Python fallbacks (matching the same API) are provided for every C++ class s
 # Python 3.11+
 winget install Python.Python.3.11
 
-# FluidSynth (required for MIDI synthesis)
+# FluidSynth (required for SF2 / MIDI synthesis)
 # Download installer from https://www.fluidsynth.org/ and add to PATH
 
 # C++ build tools (required to compile daw_processors)
@@ -217,7 +291,34 @@ cd cpp_processors
 pip install .
 ```
 
-The C++ extension provides GIL-free real-time DSP. If compilation fails the app falls back to pure-Python equivalents automatically — all features remain functional.
+The C++ extension provides GIL-free real-time DSP including the `DecentSamplerEngine` and `SfizzEngine`. If compilation fails the app falls back to pure-Python equivalents automatically — all features remain functional.
+
+### SFZ support (sfizz)
+
+The C++ SFZ engine is built via `FetchContent` in CMakeLists.txt — it downloads **sfizz** from GitHub automatically at configure time. No manual step is required. To use a local sfizz build instead:
+
+```bash
+cmake -B build -DSFIZZ_ROOT=/path/to/sfizz
+```
+
+### VST3 / Audio Unit support (optional)
+
+```bash
+# Hosting via pedalboard (VST3 on all platforms, AU on macOS)
+pip install pedalboard sounddevice
+
+# Advanced hosting extensions (state, automation, transport) require the VST3 SDK:
+cmake -B build -DVST3_SDK_ROOT=/path/to/vst3sdk
+# Without the SDK the Vst3BusManager / Vst3StateManager classes compile as no-op stubs.
+```
+
+### Decent Sampler presets
+
+Download any free `.dspreset` instrument pack (e.g. from **Decent Samples**). No installation needed — use **"◈ Load DS Preset…"** in the Add Track dialog or open the **DS INSTRUMENT** dock panel and click **Load .dspreset…**.
+
+### Add a SoundFont (SF2)
+
+Download a free General MIDI SoundFont (e.g. **GeneralUser GS** or **FluidR3 GM**) and place the `.sf2` file in `assets/soundfonts/`. The app discovers it automatically on startup.
 
 ### Optional dependencies
 
@@ -225,16 +326,9 @@ The C++ extension provides GIL-free real-time DSP. If compilation fails the app 
 # MP3 export (Windows: install ffmpeg and add to PATH)
 # macOS: brew install ffmpeg
 
-# VST3 / Audio Unit plugin hosting
-pip install pedalboard sounddevice
-
 # AI tools
 pip install torch torchaudio demucs
 ```
-
-### Add a SoundFont
-
-Download a free General MIDI SoundFont (e.g. **GeneralUser GS** or **FluidR3 GM**) and place the `.sf2` file in `assets/soundfonts/`. The app discovers it automatically on startup.
 
 ### Run
 
@@ -314,7 +408,15 @@ daw_light_version/
 │   ├── soundfonts/                  # Drop .sf2 files here
 │   └── screenshots/
 ├── cpp_processors/                  # C++ DSP extension (daw_processors)
-│   ├── include/                     # 42 C++ headers
+│   ├── include/                     # C++ headers
+│   │   ├── DecentSamplerEngine.h    # DS polyphonic sampler engine + DsZoneData struct
+│   │   ├── SfizzEngine.h            # sfizz-backed SFZ instrument engine
+│   │   ├── SfzParser.h              # SFZ metadata parser (no audio dependency)
+│   │   ├── Vst3BusManager.h         # VST3 multi-bus topology + CppBusInfo struct
+│   │   ├── Vst3StateManager.h       # VST3 IComponent / IEditController state save/restore
+│   │   ├── Vst3AutomationQueue.h    # Sample-accurate IParameterChanges implementation
+│   │   ├── Vst3TransportContext.h   # ProcessContext manager for tempo/transport sync
+│   │   ├── Vst3MemoryStream.h       # IBStream implementation for state serialisation
 │   │   ├── MasterBus.h              # Real-time sum bus + audition routing
 │   │   ├── AuditionProcessor.h      # Per-mode loudness processor + AuditionMode enum
 │   │   ├── BrickwallLimiter.h       # True-peak look-ahead limiter
@@ -322,22 +424,44 @@ daw_light_version/
 │   │   ├── FullProjectRenderer.h    # Offline stereo mix bus
 │   │   ├── MultibandCompressor.h
 │   │   ├── DynamicEQ.h
-│   │   └── ...                      # 36 more processor headers
-│   ├── src/                         # 38 .cpp files + bindings.cpp
+│   │   └── ...                      # 30+ more processor headers
+│   ├── src/                         # .cpp source files + binding modules
+│   │   ├── DecentSamplerEngine.cpp  # WAV decode, ADSR, pitch-shift, voice pool
+│   │   ├── SfizzEngine.cpp          # pImpl wrapper around sfizz_synth_t
+│   │   ├── SfzParser.cpp            # SFZ text parser (regions, key/vel ranges, CC)
+│   │   ├── Vst3BusManager.cpp       # IComponent bus query + activateBus(); stubs if no SDK
+│   │   ├── Vst3StateManager.cpp     # getState/setState via Vst3MemoryStream
+│   │   ├── Vst3AutomationQueue.cpp  # IParamValueQueue per block
+│   │   ├── Vst3TransportContext.cpp # ProcessContext update + advance()
 │   │   ├── MasterBus.cpp
 │   │   ├── AuditionProcessor.cpp
 │   │   ├── FullProjectRenderer.cpp
 │   │   ├── bindings.cpp             # pybind11 module entry point
+│   │   ├── bindings_sfz.cpp         # SfzParser + SfizzEngine bindings
+│   │   ├── bindings_vst3.cpp        # Vst3StateManager / Queue / Transport bindings
+│   │   ├── bindings_ds.cpp          # DsZoneData + DecentSamplerEngine + Vst3BusManager bindings
 │   │   └── ...
-│   ├── CMakeLists.txt
+│   ├── CMakeLists.txt               # FetchContent sfizz; optional VST3_SDK_ROOT
 │   └── build_win.ps1
 └── core/                            # Python application layer
     ├── gui_windows.py               # MainWindow — all UI panels wired together
-    ├── audio_engine.py              # FluidSynth wrapper
+    ├── audio_engine.py              # MIDI routing: VST → SFZ → DS → FluidSynth
     ├── midi_logic.py                # Sequencer — tracks, clips, recording, playback
+    │
+    ├── # ── Instrument backends ───────────────────────────────────────────
+    ├── sfz_engine_python.py         # SFZ factory (C++ SfizzEngine or pygame fallback)
+    ├── sfz_panel.py                 # SfzKeyRangeWidget — zone keyboard visualiser
+    ├── sfz_realtime_player.py       # sounddevice stream wrapping SfizzEngine
+    ├── dspreset_parser.py           # .dspreset XML → DsInstrumentInfo / DsZoneData
+    ├── dspreset_panel.py            # DsPresetPanel dock — knobs/sliders from <ui> block
+    ├── dspreset_engine.py           # DS factory (C++ DecentSamplerEngine or pygame fallback)
+    ├── dspreset_realtime_player.py  # sounddevice stream wrapping DecentSamplerEngine
+    ├── vst_engine.py                # VST3 / AU plugin host (pedalboard)
+    ├── vst3_host_extensions.py      # Vst3StateStore / AutomationCurve / TransportBridge
+    ├── vst3_bus_manager.py          # Python bridge for C++ Vst3BusManager
+    │
+    ├── # ── Audio tracks & FX ─────────────────────────────────────────────
     ├── audio_file_player.py         # pygame-based multi-track audio playback
-    ├── automation_lane.py           # AutomationEnvelope + AutomationPanel widget
-    ├── channel_rack.py              # Step-sequencer channel rack
     ├── audio_fx_chain.py            # Per-track C++ plugin chain
     ├── audio_fx_panel.py            # FX chain GUI panel
     ├── fx_rack_widget.py            # Insert effect rack widget
@@ -352,40 +476,55 @@ daw_light_version/
     ├── fx_plugins_pitch.py          # PitchCorrector / PitchShifter wrappers
     ├── fx_plugins_sampler.py        # Sampler plugin wrapper
     ├── fx_plugins_spatial.py        # StereoImager / DelayEcho wrappers
-    ├── fx_plugins_spectral_panning.py # SpectralPanningProcessor wrapper
+    ├── fx_plugins_spectral_panning.py  # SpectralPanningProcessor wrapper
+    │
+    ├── # ── Mixing & master bus ───────────────────────────────────────────
     ├── audio_mixer_strip.py         # Audio track mixer strip widget
     ├── master_bus_channel.py        # MasterBusChannel strip widget (VU + audition)
     ├── master_bus_python.py         # C++ MasterBus fallback + factory
+    │
+    ├── # ── Export & mastering ────────────────────────────────────────────
     ├── export_dialog.py             # Multi-format mastering export dialog
     ├── mastering_export_worker.py   # QThread mastering render worker
     ├── project_render_info.py       # Immutable render snapshot dataclasses
     ├── project_render_pipeline.py   # Full offline render orchestrator
-    ├── automation_processor_python.py  # AutomationProcessor Python fallback
-    ├── full_project_renderer_python.py # FullProjectRenderer Python fallback
-    ├── grid_snapper_python.py       # GridSnapper Python fallback
-    ├── velocity_humanizer_python.py # VelocityHumanizer Python fallback
-    ├── loudness_automation_python.py   # LoudnessAutomation Python fallback
-    ├── spectral_panning_python.py   # SpectralPanningProcessor Python fallback
-    ├── waveform_peaks_python.py     # WaveformGenerator Python fallback
-    ├── audio_loop_scheduler_python.py  # AudioLoopScheduler Python fallback
-    ├── sampler_python.py            # Sampler Python fallback
-    ├── offline_exporter_python.py   # OfflineExporter Python fallback
+    ├── export_worker.py             # Legacy single-format export worker
+    │
+    ├── # ── Timeline & automation ─────────────────────────────────────────
+    ├── automation_lane.py           # AutomationEnvelope + AutomationPanel widget
+    ├── channel_rack.py              # Step-sequencer channel rack
     ├── timeline_engine_bridge.py    # TimelineEngine Python bridge
     ├── instrument_renderer.py       # Offline instrument render helper
-    ├── instrument_preview.py        # Instrument audition widget
     ├── rack_sampler_engine.py       # Channel rack sampler engine
-    ├── import_manager.py            # File import + format detection
-    ├── project_manager.py           # Project save / load
+    │
+    ├── # ── UI helpers ────────────────────────────────────────────────────
+    ├── instrument_preview.py        # Instrument audition widget
     ├── humanizer_panel.py           # Velocity humanizer GUI panel
     ├── grid_settings_panel.py       # Grid resolution GUI panel
-    ├── export_worker.py             # Legacy single-format export worker
-    ├── ai_smart_eq.py               # AI EQ assistant
-    ├── ai_generative_reverb.py      # AI reverb generator
-    ├── ai_smart_master.py           # AI mastering pipeline
-    ├── ai_stem_splitter.py          # AI source separation (Demucs)
+    ├── import_manager.py            # File import + format detection
+    ├── project_manager.py           # Project save / load
+    │
+    ├── # ── Pure-Python fallbacks (C++ extension absent) ──────────────────
+    ├── automation_processor_python.py
+    ├── full_project_renderer_python.py
+    ├── grid_snapper_python.py
+    ├── velocity_humanizer_python.py
+    ├── loudness_automation_python.py
+    ├── spectral_panning_python.py
+    ├── waveform_peaks_python.py
+    ├── audio_loop_scheduler_python.py
+    ├── sampler_python.py
+    ├── offline_exporter_python.py
+    │
+    ├── # ── Input & control ───────────────────────────────────────────────
     ├── controller.py                # QWERTY + DualSense input mediator
     ├── effects.py                   # Legacy MIDI per-track effects chain
-    └── vst_engine.py                # VST3 / AU plugin host
+    │
+    └── # ── AI tools ──────────────────────────────────────────────────────
+        ├── ai_smart_eq.py
+        ├── ai_generative_reverb.py
+        ├── ai_smart_master.py
+        └── ai_stem_splitter.py
 ```
 
 ---
@@ -395,8 +534,8 @@ daw_light_version/
 | Package | Purpose |
 |---|---|
 | `PySide6` | Qt6 GUI framework |
-| `pyfluidsynth` | FluidSynth bindings for MIDI synthesis |
-| `pygame` | Gamepad input + multi-channel audio output |
+| `pyfluidsynth` | FluidSynth bindings for SF2 MIDI synthesis |
+| `pygame` | Gamepad input + audio fallback output |
 | `mido` | MIDI file I/O |
 | `python-rtmidi` | External MIDI device support |
 | `numpy` | Audio buffer arithmetic |
@@ -404,7 +543,7 @@ daw_light_version/
 | `pyloudnorm` | LUFS loudness measurement for export targets |
 | `soundfile` | WAV / FLAC read-write |
 | `pedalboard` *(optional)* | VST3 / Audio Unit plugin hosting + audio file I/O |
-| `sounddevice` *(optional)* | Audio device I/O |
+| `sounddevice` *(optional)* | Real-time audio I/O for SFZ and DS players |
 | `pybind11` | C++ → Python binding (build-time only) |
 | `torch` / `torchaudio` / `demucs` *(optional)* | AI stem splitting |
 

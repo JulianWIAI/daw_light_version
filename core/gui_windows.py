@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QDialog, QGridLayout, QLineEdit, QMessageBox, QFileDialog, QInputDialog,
     QListWidget, QListWidgetItem, QSplitter, QSizePolicy, QCheckBox,
     QGroupBox, QDial, QStackedWidget, QMenu, QRadioButton, QButtonGroup,
-    QProgressDialog, QTabWidget,
+    QProgressDialog, QTabWidget, QTableWidget, QTableWidgetItem,
 )
 
 from .audio_engine import AudioEngine, InstrumentPlugin, GM_INSTRUMENTS
@@ -73,6 +73,14 @@ from .mastering_export_worker import TrackRenderInfo
 from .project_render_info import AutomationRenderInfo, MidiTrackRenderInfo, FullProjectRenderInfo
 from .master_bus_python import get_master_bus
 from .master_bus_channel import MasterBusChannel
+from .sfz_engine_python import get_sfz_engine, parse_sfz
+from .sfz_panel import SfzKeyRangeWidget
+from .sfz_realtime_player import SfzRealTimePlayer
+# Decent Sampler (.dspreset) support — parser, GUI panel, engine factory, player.
+from .dspreset_parser import parse_dspreset
+from .dspreset_panel import DsPresetPanel
+from .dspreset_engine import get_ds_engine, load_preset_into_engine
+from .dspreset_realtime_player import DsRealTimePlayer
 
 logger = logging.getLogger(__name__)
 
@@ -2258,25 +2266,41 @@ class TransportBar(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Change Instrument Dialog
+# Instrument Selector Dialog  (SF2 / SFZ / VST3)
 # ═══════════════════════════════════════════════════════════════════════════
 
-class ChangeInstrumentDialog(QDialog):
-    """Browse GM presets and optionally a custom SF2 to reassign a track's sound.
-    The track's notes are untouched — only the instrument binding changes."""
+class InstrumentSelectorDialog(QDialog):
+    """
+    Unified instrument selector for existing tracks.  Three pages toggled by
+    buttons at the top: SF2 soundfont, SFZ instrument, VST3 plugin.
+
+    result_info() returns one of:
+        ("sf2",  sf2_path, bank, preset, preset_name)
+        ("sfz",  sfz_path, instrument_name)
+        ("vst3", plugin_path, plugin_name)
+    Returns None if cancelled.
+    """
+
+    # Tab labels and matching accent colours for each instrument source.
+    _TAB_LABELS = ["SF2  SOUNDFONT", "SFZ  INSTRUMENT",
+                   "VST3  PLUGIN",   "DS  DECENT SAMPLER"]
+    _TAB_COLORS = [C["cyan"], C["lime"], C["purple"], C["gold"]]
 
     def __init__(self, engine: AudioEngine, track_name: str,
                  parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self._engine = engine
-        self._result_info: Optional[tuple] = None  # (sf2_path, bank, preset)
+        self._engine    = engine
+        self._result:   Optional[tuple] = None
+        self._sfz_path: str = ""
+        self._vst3_path: str = ""
+        self._ds_path:  str = ""   # Absolute path to the selected .dspreset file.
 
         self.setWindowTitle(f"Change Instrument  —  {track_name}")
-        self.setMinimumSize(600, 440)
+        self.setMinimumSize(680, 540)
         self.setStyleSheet(STYLESHEET)
 
         root = QVBoxLayout(self)
-        root.setSpacing(10)
+        root.setSpacing(8)
         root.setContentsMargins(14, 14, 14, 14)
 
         hdr = _label("CHANGE INSTRUMENT", C["cyan"], 13, True)
@@ -2286,73 +2310,328 @@ class ChangeInstrumentDialog(QDialog):
         )
         root.addWidget(hdr)
 
-        # SF2 picker
+        # ── Tab selector ───────────────────────────────────────────────────
+        tab_row = QHBoxLayout()
+        tab_row.setSpacing(2)
+        self._tab_btns: List[QPushButton] = []
+        for i, (lbl, col) in enumerate(zip(self._TAB_LABELS, self._TAB_COLORS)):
+            btn = QPushButton(lbl)
+            btn.setCheckable(True)
+            btn.setFixedHeight(28)
+            btn.clicked.connect(lambda _checked, idx=i: self._switch_tab(idx))
+            tab_row.addWidget(btn)
+            self._tab_btns.append(btn)
+        tab_row.addStretch()
+        root.addLayout(tab_row)
+
+        # ── Stacked pages ──────────────────────────────────────────────────
+        self._stack = QStackedWidget()
+        root.addWidget(self._stack, stretch=1)
+        self._stack.addWidget(self._build_sf2_page())
+        self._stack.addWidget(self._build_sfz_page())
+        self._stack.addWidget(self._build_vst3_page())
+        # Decent Sampler page — file picker + zone summary table.
+        self._stack.addWidget(self._build_ds_page())
+
+        # ── Bottom buttons ─────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btn_row.addWidget(cancel)
+        self._ok_btn = QPushButton("✦  Apply Instrument")
+        self._ok_btn.setDefault(True)
+        self._ok_btn.clicked.connect(self._on_ok)
+        btn_row.addWidget(self._ok_btn)
+        root.addLayout(btn_row)
+
+        self._switch_tab(0)
+        self._cat_list.setCurrentRow(0)
+
+    # ── Tab switching ──────────────────────────────────────────────────────
+
+    def _switch_tab(self, idx: int) -> None:
+        for i, (btn, col) in enumerate(zip(self._tab_btns, self._TAB_COLORS)):
+            active = (i == idx)
+            btn.setChecked(active)
+            if active:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background:rgba(0,0,0,0.3); color:{col};"
+                    f" border:1px solid {col}; border-radius:4px;"
+                    f" padding:4px 16px; font-size:10px; font-weight:bold; }}"
+                    f"QPushButton:hover {{ background:rgba(0,0,0,0.5); }}"
+                )
+            else:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background:{C['deep']}; color:{C['text_dim']};"
+                    f" border:1px solid rgba(255,255,255,0.1); border-radius:4px;"
+                    f" padding:4px 16px; font-size:10px; }}"
+                    f"QPushButton:hover {{ background:{C['surface']}; color:{C['text']}; }}"
+                )
+        self._stack.setCurrentIndex(idx)
+        col = self._TAB_COLORS[idx]
+        self._ok_btn.setStyleSheet(
+            f"QPushButton {{ background:rgba(0,0,0,0.2); border:1px solid {col};"
+            f" color:{col}; border-radius:5px; padding:6px 18px; }}"
+            f"QPushButton:hover {{ background:rgba(0,0,0,0.4); }}"
+        )
+
+    # ── Page builders ──────────────────────────────────────────────────────
+
+    def _build_sf2_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 8, 0, 0)
+        lay.setSpacing(8)
+
         sf2_row = QHBoxLayout()
         sf2_row.addWidget(_label("SOUNDFONT", C["text_dim"], 10))
         self._sf2_combo = QComboBox()
-        self._sf2_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._sf2_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         sf2_files = AudioEngine.get_available_sf2_files()
         for p in sf2_files:
             self._sf2_combo.addItem(os.path.basename(p), userData=p)
         if not sf2_files:
             self._sf2_combo.addItem("— no SF2 found —", userData="")
         sf2_row.addWidget(self._sf2_combo)
-        browse = QPushButton("Browse…")
-        browse.setFixedWidth(90)
-        browse.clicked.connect(self._browse_sf2)
-        sf2_row.addWidget(browse)
-        root.addLayout(sf2_row)
+        browse_sf2 = QPushButton("Browse…")
+        browse_sf2.setFixedWidth(90)
+        browse_sf2.clicked.connect(self._browse_sf2)
+        sf2_row.addWidget(browse_sf2)
+        lay.addLayout(sf2_row)
 
-        # Category / Preset browser
-        sp = QSplitter(Qt.Horizontal)
+        sp = QSplitter(Qt.Orientation.Horizontal)
         self._cat_list = QListWidget()
         self._cat_list.setFixedWidth(155)
         for cat in GM_INSTRUMENTS:
             self._cat_list.addItem(QListWidgetItem(cat))
         self._cat_list.currentRowChanged.connect(self._on_cat)
         sp.addWidget(self._cat_list)
-
         self._pre_list = QListWidget()
         sp.addWidget(self._pre_list)
         sp.setStretchFactor(0, 0)
         sp.setStretchFactor(1, 1)
-        root.addWidget(sp, stretch=1)
+        lay.addWidget(sp, stretch=1)
 
-        # ── Live preview keyboard ──────────────────────────────────────────
-        prev_lbl = _label(
+        lay.addWidget(_label(
             "PREVIEW  ·  click keys or use A–K / W–P on your keyboard",
             C["text_dim"], 9,
-        )
-        root.addWidget(prev_lbl)
+        ))
         self._preview = InstrumentPreviewWidget(self)
         self._preview.set_note_callbacks(
-            on_note_on  = self._engine.preview_note_on,
-            on_note_off = self._engine.preview_note_off,
+            on_note_on=self._engine.preview_note_on,
+            on_note_off=self._engine.preview_note_off,
         )
-        root.addWidget(self._preview)
-        # Reload the preview sound whenever SF2 or preset selection changes.
+        lay.addWidget(self._preview)
         self._sf2_combo.currentIndexChanged.connect(self._reload_preview)
         self._pre_list.currentRowChanged.connect(self._reload_preview)
+        return page
 
-        # Buttons
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        cancel = QPushButton("Cancel")
-        cancel.clicked.connect(self.reject)
-        btn_row.addWidget(cancel)
-        ok = QPushButton("✦  Apply Instrument")
-        ok.setDefault(True)
-        ok.setStyleSheet(
-            f"QPushButton {{ background:rgba(0,229,255,0.15);"
-            f" border:1px solid {C['cyan']}; color:{C['cyan']};"
-            f" border-radius:5px; padding:6px 18px; }}"
-            f"QPushButton:hover {{ background:rgba(0,229,255,0.3); }}"
+    def _build_sfz_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 8, 0, 0)
+        lay.setSpacing(8)
+
+        browse_row = QHBoxLayout()
+        browse_row.addWidget(_label("SFZ FILE", C["text_dim"], 10))
+        self._sfz_path_lbl = QLabel("(no file selected)")
+        self._sfz_path_lbl.setStyleSheet(
+            f"color:{C['text_dim']}; font-size:10px; background:transparent;")
+        self._sfz_path_lbl.setWordWrap(True)
+        browse_row.addWidget(self._sfz_path_lbl, stretch=1)
+        browse_sfz_btn = QPushButton("Browse SFZ…")
+        browse_sfz_btn.setFixedWidth(110)
+        browse_sfz_btn.setStyleSheet(
+            f"QPushButton {{ background:{C['deep']}; color:{C['lime']};"
+            f" border:1px solid rgba(57,255,20,0.4); border-radius:4px;"
+            f" padding:4px 10px; font-size:10px; }}"
+            f"QPushButton:hover {{ background:rgba(57,255,20,0.1); }}"
         )
-        ok.clicked.connect(self._on_ok)
-        btn_row.addWidget(ok)
-        root.addLayout(btn_row)
+        browse_sfz_btn.clicked.connect(self._browse_sfz)
+        browse_row.addWidget(browse_sfz_btn)
+        lay.addLayout(browse_row)
 
-        self._cat_list.setCurrentRow(0)
+        self._sfz_keyboard = SfzKeyRangeWidget()
+        lay.addWidget(self._sfz_keyboard)
+
+        self._sfz_table = QTableWidget(0, 5)
+        self._sfz_table.setHorizontalHeaderLabels(
+            ["Key Lo", "Key Hi", "Vel Lo", "Vel Hi", "Sample"])
+        self._sfz_table.horizontalHeader().setStretchLastSection(True)
+        self._sfz_table.setAlternatingRowColors(True)
+        self._sfz_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._sfz_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+        self._sfz_table.setStyleSheet(
+            f"QTableWidget {{ background:{C['deep']}; color:{C['text']};"
+            f" gridline-color:{C['surface']};"
+            f" border:1px solid rgba(57,255,20,0.2); }}"
+            f"QHeaderView::section {{ background:{C['abyss']}; color:{C['text_dim']};"
+            f" border:none; padding:2px; }}"
+            f"QTableWidget::item:alternate {{ background:{C['abyss']}; }}"
+        )
+        lay.addWidget(self._sfz_table, stretch=1)
+
+        self._sfz_name_lbl = _label("", C["lime"], 11)
+        self._sfz_name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self._sfz_name_lbl)
+        return page
+
+    def _build_vst3_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 8, 0, 0)
+        lay.setSpacing(8)
+
+        scan_row = QHBoxLayout()
+        scan_btn = QPushButton("↺  Scan System Paths")
+        scan_btn.setFixedWidth(180)
+        scan_btn.setStyleSheet(
+            f"QPushButton {{ background:{C['deep']}; color:{C['purple']};"
+            f" border:1px solid rgba(153,69,255,0.4); border-radius:4px;"
+            f" padding:4px 12px; }}"
+            f"QPushButton:hover {{ background:rgba(153,69,255,0.2); }}"
+        )
+        scan_btn.clicked.connect(self._scan_vst3)
+        scan_row.addWidget(scan_btn)
+        self._vst3_hint = QLabel("")
+        self._vst3_hint.setStyleSheet(
+            f"color:{C['text_dim']}; font-size:10px;")
+        scan_row.addWidget(self._vst3_hint)
+        scan_row.addStretch()
+        lay.addLayout(scan_row)
+
+        self._vst3_list = QListWidget()
+        self._vst3_list.setStyleSheet(
+            f"QListWidget {{ background:{C['deep']};"
+            f" border:1px solid rgba(153,69,255,0.3); border-radius:4px; }}"
+            f"QListWidget::item {{ color:{C['text']}; padding:4px 8px; }}"
+            f"QListWidget::item:selected {{ background:rgba(153,69,255,0.25);"
+            f" color:{C['purple']}; }}"
+        )
+        self._vst3_list.currentRowChanged.connect(self._on_vst3_row_changed)
+        lay.addWidget(self._vst3_list, stretch=1)
+
+        browse_vst_row = QHBoxLayout()
+        browse_vst_row.addWidget(
+            _label("Or choose a file manually:", C["text_dim"], 10))
+        browse_vst_btn = QPushButton("Browse…")
+        browse_vst_btn.setFixedWidth(100)
+        browse_vst_btn.clicked.connect(self._browse_vst3)
+        browse_vst_row.addWidget(browse_vst_btn)
+        browse_vst_row.addStretch()
+        lay.addLayout(browse_vst_row)
+
+        self._scan_vst3()
+        return page
+
+    def _build_ds_page(self) -> QWidget:
+        """
+        Decent Sampler tab page.
+
+        Lets the user browse for a .dspreset file and shows a summary table
+        of the zones parsed from it (key range, velocity range, sample path).
+        The actual audio loading happens after the dialog is accepted.
+        """
+        page = QWidget()
+        lay  = QVBoxLayout(page)
+        lay.setContentsMargins(0, 8, 0, 0)
+        lay.setSpacing(8)
+
+        # ── File picker row ────────────────────────────────────────────────
+        browse_row = QHBoxLayout()
+        browse_row.addWidget(_label("DSPRESET FILE", C["text_dim"], 10))
+        # Shows the file name after the user picks one.
+        self._ds_path_lbl = QLabel("(no file selected)")
+        self._ds_path_lbl.setStyleSheet(
+            f"color:{C['text_dim']}; font-size:10px; background:transparent;")
+        self._ds_path_lbl.setWordWrap(True)
+        browse_row.addWidget(self._ds_path_lbl, stretch=1)
+        browse_ds_btn = QPushButton("Browse DS…")
+        browse_ds_btn.setFixedWidth(110)
+        browse_ds_btn.setStyleSheet(
+            f"QPushButton {{ background:{C['deep']}; color:{C['gold']};"
+            f" border:1px solid rgba(255,215,0,0.4); border-radius:4px;"
+            f" padding:4px 10px; font-size:10px; }}"
+            f"QPushButton:hover {{ background:rgba(255,215,0,0.1); }}"
+        )
+        browse_ds_btn.clicked.connect(self._browse_ds)
+        browse_row.addWidget(browse_ds_btn)
+        lay.addLayout(browse_row)
+
+        # ── Instrument name label (populated after parsing) ────────────────
+        self._ds_name_lbl = _label("", C["gold"], 11)
+        self._ds_name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self._ds_name_lbl)
+
+        # ── Zone summary table ─────────────────────────────────────────────
+        # Shows one row per zone so the user can confirm they picked the right file.
+        self._ds_table = QTableWidget(0, 4)
+        self._ds_table.setHorizontalHeaderLabels(
+            ["Key Lo", "Key Hi", "Vel Lo", "Sample"])
+        self._ds_table.horizontalHeader().setStretchLastSection(True)
+        self._ds_table.setAlternatingRowColors(True)
+        self._ds_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._ds_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+        self._ds_table.setStyleSheet(
+            f"QTableWidget {{ background:{C['deep']}; color:{C['text']};"
+            f" gridline-color:{C['surface']};"
+            f" border:1px solid rgba(255,215,0,0.2); }}"
+            f"QHeaderView::section {{ background:{C['abyss']}; color:{C['text_dim']};"
+            f" border:none; padding:2px; }}"
+            f"QTableWidget::item:alternate {{ background:{C['abyss']}; }}"
+        )
+        lay.addWidget(self._ds_table, stretch=1)
+
+        # ── Info footer (zone count, group count) ──────────────────────────
+        self._ds_info_lbl = _label("", C["text_dim"], 9)
+        lay.addWidget(self._ds_info_lbl)
+
+        return page
+
+    # ── Decent Sampler slots ───────────────────────────────────────────────
+
+    def _browse_ds(self) -> None:
+        """Open a file picker for a .dspreset file and parse it for preview."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Decent Sampler Preset",
+            os.path.expanduser("~"),
+            "Decent Sampler (*.dspreset);;All Files (*)",
+        )
+        if not path:
+            return
+        self._ds_path = path
+        self._ds_path_lbl.setText(os.path.basename(path))
+
+        # Parse the preset so the table can be populated for the user to verify.
+        try:
+            info = parse_dspreset(path)
+        except Exception as exc:
+            logger.warning("InstrumentSelectorDialog: dspreset parse failed: %s", exc)
+            self._ds_name_lbl.setText("(parse error — check the file)")
+            return
+
+        # Show instrument name and zone/group stats in the footer.
+        self._ds_name_lbl.setText(info.name)
+        self._ds_info_lbl.setText(
+            f"{info.num_zones} zones  ·  {info.num_groups} groups")
+
+        # Populate the zone table with key range, velocity range, and sample path.
+        self._ds_table.setRowCount(0)
+        for zone in info.zones:
+            row = self._ds_table.rowCount()
+            self._ds_table.insertRow(row)
+            self._ds_table.setItem(row, 0, QTableWidgetItem(str(zone.lo_note)))
+            self._ds_table.setItem(row, 1, QTableWidgetItem(str(zone.hi_note)))
+            self._ds_table.setItem(row, 2, QTableWidgetItem(str(zone.lo_vel)))
+            self._ds_table.setItem(row, 3,
+                QTableWidgetItem(os.path.basename(zone.path)))
+
+    # ── SF2 slots ──────────────────────────────────────────────────────────
 
     def _on_cat(self, row: int) -> None:
         if row < 0:
@@ -2361,7 +2640,7 @@ class ChangeInstrumentDialog(QDialog):
         self._pre_list.clear()
         for preset, bank, name in GM_INSTRUMENTS.get(cat, []):
             item = QListWidgetItem(name)
-            item.setData(Qt.UserRole, (preset, bank, name))
+            item.setData(Qt.ItemDataRole.UserRole, (preset, bank, name))
             self._pre_list.addItem(item)
         self._pre_list.setCurrentRow(0)
 
@@ -2375,58 +2654,159 @@ class ChangeInstrumentDialog(QDialog):
             self._sf2_combo.setCurrentIndex(0)
 
     def _reload_preview(self) -> None:
-        """Load the currently highlighted preset into the preview channel."""
         sf2: str = self._sf2_combo.currentData() or ""
         pre_item = self._pre_list.currentItem()
         if not sf2 or not os.path.isfile(sf2) or pre_item is None:
             return
-        preset, bank, _ = pre_item.data(Qt.UserRole)
+        preset, bank, _ = pre_item.data(Qt.ItemDataRole.UserRole)
         self._engine.load_preview_instrument(sf2, bank, preset)
 
+    # ── SFZ slots ──────────────────────────────────────────────────────────
+
+    def _browse_sfz(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open SFZ Instrument", os.path.expanduser("~"),
+            "SFZ Instruments (*.sfz);;All Files (*)"
+        )
+        if path:
+            self._load_sfz_preview(path)
+
+    def _load_sfz_preview(self, path: str) -> None:
+        self._sfz_path = path
+        self._sfz_path_lbl.setText(os.path.basename(path))
+        self._sfz_path_lbl.setStyleSheet(
+            f"color:{C['text']}; font-size:10px; background:transparent;")
+        try:
+            info = parse_sfz(path)
+            self._sfz_keyboard.set_regions(info.regions)
+            self._sfz_table.setRowCount(len(info.regions))
+            for row, r in enumerate(info.regions):
+                self._sfz_table.setItem(
+                    row, 0, QTableWidgetItem(str(r.key_range.lo)))
+                self._sfz_table.setItem(
+                    row, 1, QTableWidgetItem(str(r.key_range.hi)))
+                self._sfz_table.setItem(
+                    row, 2, QTableWidgetItem(str(r.vel_range.lo)))
+                self._sfz_table.setItem(
+                    row, 3, QTableWidgetItem(str(r.vel_range.hi)))
+                self._sfz_table.setItem(row, 4, QTableWidgetItem(r.sample))
+            self._sfz_name_lbl.setText(
+                f"{info.name}  ·  {info.num_regions} regions,"
+                f" {info.num_groups} groups"
+            )
+        except Exception as exc:
+            self._sfz_name_lbl.setText(f"Parse error: {exc}")
+
+    # ── VST3 slots ─────────────────────────────────────────────────────────
+
+    def _scan_vst3(self) -> None:
+        self._vst3_list.clear()
+        plugins = scan_vst_paths()
+        if plugins:
+            self._vst3_hint.setText(f"{len(plugins)} plugin(s) found")
+            for p in plugins:
+                item = QListWidgetItem(os.path.basename(p))
+                item.setData(Qt.ItemDataRole.UserRole, p)
+                self._vst3_list.addItem(item)
+        else:
+            self._vst3_hint.setText("No plugins found — use Browse…")
+            self._vst3_list.addItem(
+                QListWidgetItem("— No plugins found in standard directories —"))
+
+    def _on_vst3_row_changed(self, row: int) -> None:
+        item = self._vst3_list.item(row)
+        if item:
+            path = item.data(Qt.ItemDataRole.UserRole)
+            if path:
+                self._vst3_path = path
+
+    def _browse_vst3(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select VST3 Plugin", os.path.expanduser("~"),
+            "Plugin Files (*.vst3 *.component);;All Files (*)",
+        )
+        if path:
+            self._vst3_path = path
+            item = QListWidgetItem(os.path.basename(path))
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            self._vst3_list.insertItem(0, item)
+            self._vst3_list.setCurrentRow(0)
+
+    # ── Apply / lifecycle ──────────────────────────────────────────────────
+
     def _on_ok(self) -> None:
-        sf2: str = self._sf2_combo.currentData() or ""
-        if not sf2 or not os.path.isfile(sf2):
-            QMessageBox.warning(self, "No SoundFont",
-                "Please select a valid .sf2 file or click Browse…")
-            return
-        pre_item = self._pre_list.currentItem()
-        if pre_item is None:
-            QMessageBox.warning(self, "No Instrument",
-                "Please select an instrument.")
-            return
-        preset, bank, preset_name = pre_item.data(Qt.UserRole)
-        self._result_info = (sf2, bank, preset, preset_name)
+        idx = self._stack.currentIndex()
+        if idx == 0:  # SF2
+            sf2: str = self._sf2_combo.currentData() or ""
+            if not sf2 or not os.path.isfile(sf2):
+                QMessageBox.warning(self, "No SoundFont",
+                    "Please select a valid .sf2 file or click Browse…")
+                return
+            pre_item = self._pre_list.currentItem()
+            if pre_item is None:
+                QMessageBox.warning(self, "No Instrument",
+                    "Please select an instrument.")
+                return
+            preset, bank, preset_name = pre_item.data(Qt.ItemDataRole.UserRole)
+            self._result = ("sf2", sf2, bank, preset, preset_name)
+        elif idx == 1:  # SFZ
+            if not self._sfz_path or not os.path.isfile(self._sfz_path):
+                QMessageBox.warning(self, "No SFZ File",
+                    "Please browse and select a .sfz instrument file.")
+                return
+            name = os.path.splitext(os.path.basename(self._sfz_path))[0]
+            self._result = ("sfz", self._sfz_path, name)
+        elif idx == 2:  # VST3
+            if not self._vst3_path or not os.path.isfile(self._vst3_path):
+                QMessageBox.warning(self, "No Plugin",
+                    "Please select a plugin from the list or use Browse…")
+                return
+            name = os.path.splitext(os.path.basename(self._vst3_path))[0]
+            self._result = ("vst3", self._vst3_path, name)
+        else:           # DS — Decent Sampler (.dspreset)
+            if not self._ds_path or not os.path.isfile(self._ds_path):
+                QMessageBox.warning(self, "No Preset",
+                    "Please browse and select a .dspreset file.")
+                return
+            name = os.path.splitext(os.path.basename(self._ds_path))[0]
+            self._result = ("ds", self._ds_path, name)
         self._cleanup_preview()
         self.accept()
 
     def _cleanup_preview(self) -> None:
-        """Silence all preview notes and unload the temporary soundfont."""
         self._preview.silence_all()
         self._engine.unload_preview_instrument()
 
     def done(self, result: int) -> None:
-        """Ensure preview is cleaned up on any close path (accept or reject)."""
         self._cleanup_preview()
         super().done(result)
 
-    # Forward dialog-level keyboard events to the preview widget so
-    # note shortcuts work even when the list widget has focus.
     def keyPressEvent(self, event) -> None:
         from PySide6.QtWidgets import QLineEdit
-        if not isinstance(self.focusWidget(), QLineEdit):
+        if self._stack.currentIndex() == 0 and not isinstance(
+                self.focusWidget(), QLineEdit):
             self._preview.keyPressEvent(event)
         else:
             super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event) -> None:
         from PySide6.QtWidgets import QLineEdit
-        if not isinstance(self.focusWidget(), QLineEdit):
+        if self._stack.currentIndex() == 0 and not isinstance(
+                self.focusWidget(), QLineEdit):
             self._preview.keyReleaseEvent(event)
         else:
             super().keyReleaseEvent(event)
 
+    def result_info(self) -> Optional[tuple]:
+        return self._result
+
+    # Backward-compat alias kept so any external code still compiles.
     def result_plugin_info(self) -> Optional[tuple]:
-        return self._result_info
+        return self._result
+
+
+# Keep the old name available in case anything imports it directly.
+ChangeInstrumentDialog = InstrumentSelectorDialog
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2895,6 +3275,11 @@ class AddTrackDialog(QDialog):
         self._result_track:     Optional[MidiTrack]       = None
         self._result_plugin:    Optional[InstrumentPlugin] = None
         self._result_vst_track: Optional[VstTrack]        = None
+        self._result_sfz_track: Optional[MidiTrack]       = None
+        self._result_sfz_path:  str                       = ""
+        # Decent Sampler track result (set when user picks a .dspreset file).
+        self._result_ds_track:  Optional[MidiTrack]       = None
+        self._result_ds_path:   str                       = ""
 
         self.setWindowTitle("✦  Add Instrument Track")
         self.setMinimumSize(600, 500)
@@ -2987,17 +3372,37 @@ class AddTrackDialog(QDialog):
         btn_row.addWidget(ok)
         root.addLayout(btn_row)
 
-        # VST alternative — opens a separate browser dialog
-        vst_sep = QFrame()
-        vst_sep.setFrameShape(QFrame.HLine)
-        vst_sep.setStyleSheet(f"color:rgba(153,69,255,0.3);")
-        root.addWidget(vst_sep)
+        # Alternative instrument sources: SFZ and VST3
+        alt_sep = QFrame()
+        alt_sep.setFrameShape(QFrame.Shape.HLine)
+        alt_sep.setStyleSheet("color:rgba(153,69,255,0.3);")
+        root.addWidget(alt_sep)
 
-        vst_row = QHBoxLayout()
-        vst_hint = _label("No SoundFont?  Load a VST3 or AU plugin instead:",
-                           C["text_dim"], 10)
-        vst_row.addWidget(vst_hint)
-        vst_row.addStretch()
+        alt_row = QHBoxLayout()
+        alt_row.addWidget(
+            _label("No SoundFont?  Use SFZ, DS or VST3 instead:", C["text_dim"], 10))
+        alt_row.addStretch()
+        sfz_btn = QPushButton("♪  Load SFZ Instrument…")
+        sfz_btn.setStyleSheet(
+            f"QPushButton {{ background:rgba(57,255,20,0.08);"
+            f" color:{C['lime']}; border:1px solid rgba(57,255,20,0.4);"
+            f" border-radius:4px; padding:5px 14px; }}"
+            f"QPushButton:hover {{ background:rgba(57,255,20,0.22); }}"
+        )
+        sfz_btn.clicked.connect(self._on_load_sfz)
+        alt_row.addWidget(sfz_btn)
+
+        # Decent Sampler (.dspreset) track button.
+        ds_btn = QPushButton("◈  Load DS Preset…")
+        ds_btn.setStyleSheet(
+            f"QPushButton {{ background:rgba(255,215,0,0.08);"
+            f" color:{C['gold']}; border:1px solid rgba(255,215,0,0.4);"
+            f" border-radius:4px; padding:5px 14px; }}"
+            f"QPushButton:hover {{ background:rgba(255,215,0,0.22); }}"
+        )
+        ds_btn.clicked.connect(self._on_load_ds)
+        alt_row.addWidget(ds_btn)
+
         vst_btn = QPushButton("⬡  Load VST / AU Plugin…")
         vst_btn.setStyleSheet(
             f"QPushButton {{ background:rgba(153,69,255,0.12);"
@@ -3006,8 +3411,8 @@ class AddTrackDialog(QDialog):
             f"QPushButton:hover {{ background:rgba(153,69,255,0.28); }}"
         )
         vst_btn.clicked.connect(self._on_load_vst)
-        vst_row.addWidget(vst_btn)
-        root.addLayout(vst_row)
+        alt_row.addWidget(vst_btn)
+        root.addLayout(alt_row)
 
         self._cat_list.setCurrentRow(0)
 
@@ -3101,10 +3506,31 @@ class AddTrackDialog(QDialog):
         self._cleanup_preview()
         self.accept()
 
+    def _on_load_sfz(self) -> None:
+        """Open a file picker for an SFZ file, then accept with an SFZ track result."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open SFZ Instrument", os.path.expanduser("~"),
+            "SFZ Instruments (*.sfz);;All Files (*)",
+        )
+        if not path:
+            return
+        name_edit = self._name_edit.text().strip()
+        name = name_edit or os.path.splitext(os.path.basename(path))[0]
+        ch = self._engine.next_free_channel(is_drums=False)
+        if ch == -1:
+            QMessageBox.warning(self, "No Free Channel",
+                "All 16 MIDI channels are occupied. Remove a track first.")
+            return
+        col = C["tracks"][ch % len(C["tracks"])]
+        self._result_sfz_track = MidiTrack(name=name, channel=ch, color=col)
+        self._result_sfz_path  = path
+        self._cleanup_preview()
+        self.accept()
+
     def _on_load_vst(self) -> None:
         """Open the VST browser; if a plugin is chosen, create a VstTrack and accept."""
         dlg = VstBrowserDialog(self)
-        if dlg.exec() != QDialog.Accepted:
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         path = dlg.result_path()
         name = dlg.result_name()
@@ -3120,9 +3546,42 @@ class AddTrackDialog(QDialog):
             name=name, plugin_path=path, channel=ch, color=col)
         self.accept()
 
+    def _on_load_ds(self) -> None:
+        """
+        Open a file picker for a .dspreset file, then accept the dialog
+        with a Decent Sampler track result.
+        """
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Decent Sampler Preset",
+            os.path.expanduser("~"),
+            "Decent Sampler (*.dspreset);;All Files (*)",
+        )
+        if not path:
+            return
+        # Derive track name: prefer what the user typed, fall back to file stem.
+        name_edit = self._name_edit.text().strip()
+        name = name_edit or os.path.splitext(os.path.basename(path))[0]
+        ch = self._engine.next_free_channel(is_drums=False)
+        if ch == -1:
+            QMessageBox.warning(self, "No Free Channel",
+                "All 16 MIDI channels are occupied. Remove a track first.")
+            return
+        col = C["tracks"][ch % len(C["tracks"])]
+        self._result_ds_track = MidiTrack(name=name, channel=ch, color=col)
+        self._result_ds_path  = path
+        self._cleanup_preview()
+        self.accept()
+
+    # ── Result accessors ───────────────────────────────────────────────────
+
     def result_track(self)     -> Optional[MidiTrack]:       return self._result_track
     def result_plugin(self)    -> Optional[InstrumentPlugin]: return self._result_plugin
     def result_vst_track(self) -> Optional[VstTrack]:        return self._result_vst_track
+    def result_sfz_track(self) -> Optional[MidiTrack]:       return self._result_sfz_track
+    def result_sfz_path(self)  -> str:                       return self._result_sfz_path
+    def result_ds_track(self)  -> Optional[MidiTrack]:       return self._result_ds_track
+    def result_ds_path(self)   -> str:                       return self._result_ds_path
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4025,6 +4484,8 @@ class MainWindow(QMainWindow):
         self._pygame_sounds: Dict[str, object] = {}
         self._gamepad_timer: Optional[QTimer] = None   # drives controller.poll_once()
         self._instrument_names: Dict[int, str] = {}    # channel -> current preset name
+        self._sfz_engines:     Dict[int, object] = {}  # channel -> SfizRealTimePlayer
+        self._ds_engines:      Dict[int, object] = {}  # channel -> DsRealTimePlayer
         self._note_clipboard:  List[dict]     = []    # copy/paste buffer for piano roll notes
 
         # Per-audio-track FX engine and FX chain registry.
@@ -4600,6 +5061,16 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, self._humanizer_dock)
         self.tabifyDockWidget(self._audio_fx_dock, self._humanizer_dock)
 
+        # -- Decent Sampler preset panel ------------------------------------
+        # DsPresetPanel is a self-contained dock with a "Load .dspreset…"
+        # button, dynamic knob/slider/button widgets, and MIDI CC routing.
+        # The engine reference is set to None here; _start_ds_player() wires
+        # in the real C++ DecentSamplerEngine once a track is loaded.
+        self._ds_panel = DsPresetPanel(ds_engine=None, parent=self)
+        self._ds_panel.parameter_changed.connect(self._on_ds_parameter_changed)
+        self.addDockWidget(Qt.RightDockWidgetArea, self._ds_panel)
+        self.tabifyDockWidget(self._humanizer_dock, self._ds_panel)
+
         # Default to showing the MIDI effects panel.
         self._midi_fx_dock.raise_()
 
@@ -5069,6 +5540,24 @@ class MainWindow(QMainWindow):
         self._engine.unregister_vst_player(channel)
         self._engine.unregister_instrument(channel)
         self._vst_manager.remove_track(channel)   # also stops real-time player
+        # Stop and unregister any SFZ player on this channel.
+        sfz_player = self._sfz_engines.pop(channel, None)
+        if sfz_player is not None:
+            self._engine.unregister_sfz_player(channel)
+            try:
+                sfz_player.stop()
+            except Exception:
+                pass
+
+        # Stop and unregister any Decent Sampler player on this channel.
+        ds_player = self._ds_engines.pop(channel, None)
+        if ds_player is not None:
+            self._engine.unregister_ds_player(channel)
+            try:
+                ds_player.stop()
+            except Exception:
+                pass
+
         self._midi.remove_track(channel)
         self._effect_chains.pop(channel, None)
         self._instrument_names.pop(channel, None)
@@ -5472,28 +5961,64 @@ class MainWindow(QMainWindow):
         track = self._midi.get_track(channel)
         if not track:
             return
-        dlg = ChangeInstrumentDialog(self._engine, track.name, self)
-        if dlg.exec() != QDialog.Accepted:
+        dlg = InstrumentSelectorDialog(self._engine, track.name, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        info = dlg.result_plugin_info()
+        info = dlg.result_info()
         if not info:
             return
-        sf2, bank, preset, preset_name = info
-        # Do NOT overwrite track.name — the user may have given it a custom name.
-        # Store the instrument preset name separately and show it as a subtitle.
-        self._instrument_names[channel] = preset_name
-        plugin = InstrumentPlugin(
-            name=preset_name, sf2_path=sf2,
-            bank=bank, preset=preset, channel=channel,
-        )
-        self._engine.register_instrument(plugin)
+
+        kind = info[0]
         strip = self._mixer_strips.get(channel)
-        if strip:
-            strip.set_instrument_name(preset_name)
-        if channel == self._selected_channel:
-            self._piano_roll_title.setText(f"PIANO ROLL  —  {track.name}")
-        self._st_engine.setText(
-            f"Instrument changed → '{preset_name}'  (CH {channel + 1})")
+
+        if kind == "sf2":
+            _, sf2, bank, preset, preset_name = info
+            self._instrument_names[channel] = preset_name
+            plugin = InstrumentPlugin(
+                name=preset_name, sf2_path=sf2,
+                bank=bank, preset=preset, channel=channel,
+            )
+            self._engine.register_instrument(plugin)
+            if strip:
+                strip.set_instrument_name(preset_name)
+            if channel == self._selected_channel:
+                self._piano_roll_title.setText(f"PIANO ROLL  —  {track.name}")
+            self._st_engine.setText(
+                f"Instrument changed → '{preset_name}'  (CH {channel + 1})")
+
+        elif kind == "sfz":
+            _, sfz_path, name = info
+            self._instrument_names[channel] = name
+            self._start_sfz_player(channel, sfz_path)
+            if strip:
+                strip.set_instrument_name(name)
+            if channel == self._selected_channel:
+                self._piano_roll_title.setText(f"PIANO ROLL  —  {track.name}")
+            self._st_engine.setText(
+                f"SFZ instrument loaded → '{name}'  (CH {channel + 1})")
+
+        elif kind == "vst3":
+            _, plugin_path, plugin_name = info
+            self._instrument_names[channel] = plugin_name
+            if strip:
+                strip.set_instrument_name(plugin_name)
+            if channel == self._selected_channel:
+                self._piano_roll_title.setText(f"PIANO ROLL  —  {track.name}")
+            self._st_engine.setText(
+                f"VST3 plugin assigned → '{plugin_name}'  (CH {channel + 1})")
+
+        elif kind == "ds":
+            # Decent Sampler: load the .dspreset, start the audio player,
+            # and wire the DS panel to show the preset's knobs/sliders.
+            _, ds_path, ds_name = info
+            self._instrument_names[channel] = ds_name
+            self._start_ds_player(channel, ds_path)
+            if strip:
+                strip.set_instrument_name(ds_name)
+            if channel == self._selected_channel:
+                self._piano_roll_title.setText(f"PIANO ROLL  —  {track.name}")
+            self._st_engine.setText(
+                f"DS instrument loaded → '{ds_name}'  (CH {channel + 1})")
 
     # ── Audio drop from arrangement view ──────────────────────────────────
 
@@ -5535,12 +6060,20 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_add_track(self) -> None:
         dlg = AddTrackDialog(self._engine, self)
-        if dlg.exec() != QDialog.Accepted:
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        # VST path takes priority; SF2 path is the default
         vst = dlg.result_vst_track()
         if vst:
             self._on_add_vst_track(vst)
+            return
+        sfz_track = dlg.result_sfz_track()
+        if sfz_track:
+            self._on_add_sfz_track(sfz_track, dlg.result_sfz_path())
+            return
+        # Check for a Decent Sampler track before falling through to SF2.
+        ds_track = dlg.result_ds_track()
+        if ds_track:
+            self._on_add_ds_track(ds_track, dlg.result_ds_path())
             return
         track, plugin = dlg.result_track(), dlg.result_plugin()
         if track and plugin:
@@ -5625,6 +6158,117 @@ class MainWindow(QMainWindow):
         self._view_stack.setCurrentIndex(0)
 
     # ── VST track ─────────────────────────────────────────────────────────────
+
+    def _on_add_sfz_track(self, track: MidiTrack, sfz_path: str) -> None:
+        """Create a MIDI track backed by an SFZ instrument engine."""
+        dummy_plugin = InstrumentPlugin(
+            name=track.name, sf2_path="", bank=0, preset=0, channel=track.channel)
+        self.add_track(track, dummy_plugin)
+        self._start_sfz_player(track.channel, sfz_path)
+        self._active_clip = None
+        self._piano_roll.set_active_clip(None)
+        self._on_track_selected(track.channel)
+        self._refresh_piano_roll()
+        self._st_engine.setText(
+            f"Engine: SFZ Track '{track.name}' loaded  (CH {track.channel + 1})")
+
+    def _start_sfz_player(self, channel: int, sfz_path: str) -> None:
+        """Load an SFZ file, create an SfzRealTimePlayer, and register it."""
+        # Stop any existing SFZ player on this channel first.
+        old = self._sfz_engines.pop(channel, None)
+        if old is not None:
+            self._engine.unregister_sfz_player(channel)
+            try:
+                old.stop()
+            except Exception:
+                pass
+        sfz_engine = get_sfz_engine(SfzRealTimePlayer.SAMPLE_RATE,
+                                    SfzRealTimePlayer.BLOCK_SIZE)
+        sfz_engine.load_sfz(sfz_path)
+        player = SfzRealTimePlayer(sfz_engine)
+        if not player.start():
+            logger.warning("SFZ player could not start audio stream for CH %d", channel)
+        self._sfz_engines[channel] = player
+        self._engine.register_sfz_player(channel, player)
+
+    # ── Decent Sampler track management ───────────────────────────────────────
+
+    def _on_add_ds_track(self, track: MidiTrack, ds_path: str) -> None:
+        """
+        Create a MIDI track backed by a Decent Sampler (.dspreset) engine.
+
+        Follows the same pattern as _on_add_sfz_track: a dummy InstrumentPlugin
+        reserves the MIDI channel in AudioEngine while the real audio comes from
+        the DsRealTimePlayer registered on the same channel.
+        """
+        # Reserve the channel with a placeholder plugin (no SF2 file).
+        dummy_plugin = InstrumentPlugin(
+            name=track.name, sf2_path="", bank=0, preset=0, channel=track.channel)
+        self.add_track(track, dummy_plugin)
+
+        # Load the DS preset and start the audio stream.
+        self._start_ds_player(track.channel, ds_path)
+
+        # Show the DS panel docked on the right and raise it.
+        self._ds_panel.raise_()
+
+        self._active_clip = None
+        self._piano_roll.set_active_clip(None)
+        self._on_track_selected(track.channel)
+        self._refresh_piano_roll()
+        self._st_engine.setText(
+            f"Engine: DS Track '{track.name}' loaded  (CH {track.channel + 1})")
+
+    def _start_ds_player(self, channel: int, ds_path: str) -> None:
+        """
+        Load a .dspreset file, create a DsRealTimePlayer, and register it
+        on the given MIDI channel.  Any previous DS player on the channel is
+        stopped and unregistered first.
+        """
+        # Tear down any existing DS player on this channel.
+        old = self._ds_engines.pop(channel, None)
+        if old is not None:
+            self._engine.unregister_ds_player(channel)
+            try:
+                old.stop()
+            except Exception:
+                pass
+
+        # Parse the preset to get zone data, then hand it to the C++ engine.
+        ds_engine = get_ds_engine(DsRealTimePlayer.SAMPLE_RATE,
+                                   DsRealTimePlayer.BLOCK_SIZE)
+        try:
+            info = parse_dspreset(ds_path)
+            load_preset_into_engine(ds_engine, info)
+        except Exception as exc:
+            logger.warning(
+                "_start_ds_player: preset load failed for '%s': %s", ds_path, exc)
+
+        # Open the sounddevice audio stream.
+        player = DsRealTimePlayer(ds_engine)
+        if not player.start():
+            logger.warning(
+                "DS player could not open audio stream for CH %d", channel)
+
+        # Register with AudioEngine so note_on/off are routed here.
+        self._ds_engines[channel] = player
+        self._engine.register_ds_player(channel, player)
+
+        # Wire the DS panel to this engine so its knobs/sliders update the sound.
+        self._ds_panel.set_engine(ds_engine)
+        self._ds_panel.load_preset(ds_path)
+        self._ds_panel.raise_()
+
+    @Slot(str, float)
+    def _on_ds_parameter_changed(self, param: str, value: float) -> None:
+        """
+        Called by DsPresetPanel when the user moves a knob or slider.
+        The panel already forwarded the change to its C++ engine; this slot
+        is available for project-level parameter recording if needed in future.
+        """
+        # Nothing to do here yet — the panel handles engine routing directly.
+        # This slot exists as a hook for future automation recording.
+        pass
 
     def _on_add_vst_track(self, vst_track: VstTrack) -> None:
         """

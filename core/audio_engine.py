@@ -317,6 +317,8 @@ class AudioEngine:
         self._running = False
         self._next_channel = 0                     # auto-assign channels (0-15)
         self._vst_players: Dict[int, object] = {}  # channel → VstRealTimePlayer
+        self._sfz_players: Dict[int, object] = {}  # channel → SfzRealTimePlayer
+        self._ds_players:  Dict[int, object] = {}  # channel → DsRealTimePlayer
 
         # Dedicated MIDI channel used exclusively for instrument auditioning.
         # Never registered in _instruments so it does not appear in the mixer.
@@ -479,6 +481,33 @@ class AudioEngine:
         """Remove VST routing for *channel* (FluidSynth takes over again)."""
         self._vst_players.pop(channel, None)
 
+    # ── SFZ real-time player registration ─────────────────────────────────
+
+    def register_sfz_player(self, channel: int, player: object) -> None:
+        """Register an SfzRealTimePlayer for *channel*; note_on/off route there."""
+        self._sfz_players[channel] = player
+
+    def unregister_sfz_player(self, channel: int) -> None:
+        """Remove SFZ routing for *channel*.  Caller must stop the player."""
+        self._sfz_players.pop(channel, None)
+
+    # ── Decent Sampler real-time player registration ──────────────────────
+
+    def register_ds_player(self, channel: int, player: object) -> None:
+        """
+        Register a DsRealTimePlayer for *channel*.
+        All note_on/note_off events on this channel will be routed to
+        the DS engine instead of FluidSynth or any other backend.
+        """
+        self._ds_players[channel] = player
+
+    def unregister_ds_player(self, channel: int) -> None:
+        """
+        Remove DS routing for *channel*.
+        The caller is responsible for stopping the player before calling this.
+        """
+        self._ds_players.pop(channel, None)
+
     def get_instruments(self) -> List[InstrumentPlugin]:
         """Return a snapshot of all registered instruments."""
         return list(self._instruments.values())
@@ -502,7 +531,11 @@ class AudioEngine:
         # Walk channels 0-15, skipping 9 and any already occupied.
         # _vst_players holds VST channels that don't register FluidSynth instruments,
         # so they must be excluded here to prevent channel collisions.
-        occupied = set(self._instruments.keys()) | set(self._vst_players.keys())
+        # Collect all occupied channels across every backend.
+        occupied = (set(self._instruments.keys())
+                    | set(self._vst_players.keys())
+                    | set(self._sfz_players.keys())
+                    | set(self._ds_players.keys()))
         for candidate in list(range(0, 9)) + list(range(10, 16)):
             if candidate not in occupied:
                 return candidate
@@ -670,6 +703,18 @@ class AudioEngine:
             vst_player.note_on(pitch, velocity)
             return
 
+        # Route to SFZ real-time player when one is registered for this channel.
+        sfz_player = self._sfz_players.get(channel)
+        if sfz_player is not None:
+            sfz_player.note_on(pitch, velocity)
+            return
+
+        # Route to Decent Sampler real-time player when registered.
+        ds_player = self._ds_players.get(channel)
+        if ds_player is not None:
+            ds_player.note_on(pitch, velocity)
+            return
+
         if not self._running or self._fs is None:
             return
 
@@ -691,6 +736,17 @@ class AudioEngine:
         vst_player = self._vst_players.get(channel)
         if vst_player is not None:
             vst_player.note_off(pitch)
+            return
+
+        sfz_player = self._sfz_players.get(channel)
+        if sfz_player is not None:
+            sfz_player.note_off(pitch)
+            return
+
+        # Route note-off to the Decent Sampler player when registered.
+        ds_player = self._ds_players.get(channel)
+        if ds_player is not None:
+            ds_player.note_off(pitch)
             return
 
         if not self._running or self._fs is None:
