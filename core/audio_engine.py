@@ -324,6 +324,11 @@ class AudioEngine:
         # Never registered in _instruments so it does not appear in the mixer.
         self._preview_sfid: int = -1               # FluidSynth soundfont id for preview
 
+        # Optional telemetry sink — set externally after the engine starts.
+        # Called from the audio callback thread with a mono float32 numpy array.
+        self._telemetry_push = None
+        self._stream = None                        # sounddevice OutputStream (custom render)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -368,10 +373,35 @@ class AudioEngine:
             self._running = False
             return False
 
-        # Driver preference order by platform.
-        # pyfluidsynth does not raise on unsupported drivers (FluidSynth prints
-        # a C-level error but returns normally), so we must try the correct
-        # driver for the current OS first to avoid silently getting no audio.
+        # Preferred path: render FluidSynth ourselves via a sounddevice
+        # OutputStream so the callback is visible to Python and can be
+        # tapped for real-time telemetry analysis.
+        try:
+            import sounddevice as sd
+            import numpy as np
+            self._sd_blocksize = 1024
+            self._stream = sd.OutputStream(
+                samplerate=sample_rate,
+                blocksize=self._sd_blocksize,
+                channels=2,
+                dtype="float32",
+                callback=self._audio_cb,
+            )
+            self._stream.start()
+            self._running = True
+            logger.info(
+                "AudioEngine started via sounddevice custom stream (%.0f Hz, gain=%.2f)",
+                sample_rate, gain,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "AudioEngine: sounddevice stream failed (%s) — "
+                "falling back to FluidSynth internal driver (no telemetry tap).", exc
+            )
+
+        # Fallback: let FluidSynth drive its own audio thread.
+        # Telemetry will not receive data on this path.
         if sys.platform == "win32":
             drivers = ["wasapi", "dsound", "waveout", "portaudio"]
         elif sys.platform == "darwin":
@@ -395,6 +425,23 @@ class AudioEngine:
         self._running = False
         return False
 
+    def _audio_cb(self, outdata, frames: int, time_info, status) -> None:
+        """sounddevice callback: pull one block from FluidSynth and tap telemetry."""
+        import numpy as np
+        try:
+            raw = self._fs.get_samples(frames)   # int16, interleaved stereo, shape (frames*2,)
+            stereo = raw.astype(np.float32) * (1.0 / 32768.0)
+            stereo = stereo.reshape(frames, 2)
+        except Exception:
+            outdata.fill(0.0)
+            return
+        outdata[:] = stereo
+        if self._telemetry_push is not None:
+            try:
+                self._telemetry_push((stereo[:, 0] + stereo[:, 1]) * 0.5)
+            except Exception:
+                pass
+
     def stop(self) -> None:
         """
         Shut down FluidSynth and release audio hardware resources.
@@ -402,6 +449,13 @@ class AudioEngine:
         Why call delete() explicitly?  FluidSynth allocates C-level memory
         that the Python GC cannot see; we must free it ourselves.
         """
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
         if self._fs is not None:
             try:
                 self._fs.delete()

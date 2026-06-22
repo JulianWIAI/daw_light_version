@@ -93,6 +93,11 @@ def main() -> int:
     # Main window — starts empty; user adds tracks via the toolbar.
     window = MainWindow(engine, midi, controller)
     window._on_scale_changed()   # populate the status bar scale label
+
+    # Wire the audio engine's output to the telemetry analyzer so every note
+    # played via FluidSynth (SF2) is captured alongside SFZ/DS streams.
+    engine._telemetry_push = window._telemetry.push_audio
+
     window.show()
 
     log.info("Window ready — entering Qt event loop.")

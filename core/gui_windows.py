@@ -4727,11 +4727,6 @@ class MainWindow(QMainWindow):
                           self._on_connect_gamepad))
         tb.addWidget(_btn("⌨ KEY MAP",      "Show keyboard mapping",
                           self._on_show_map))
-        tb.addSeparator()
-        tb.addWidget(_btn("📊 TELEMETRY",
-                          "Show / hide real-time audio telemetry panels\n"
-                          "(Waveform · Freq Bands · Chroma · Waterfall · H/P)",
-                          self._telemetry.toggle, C["lime"]))
 
     def _setup_transport(self) -> None:
         self._transport = TransportBar()
@@ -5104,6 +5099,22 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self._st_engine)
         sb.addPermanentWidget(self._st_scale)
         sb.addPermanentWidget(self._st_beat)
+
+        tel_btn = QPushButton("📊 TELEMETRY")
+        tel_btn.setToolTip(
+            "Show / hide real-time audio telemetry panels\n"
+            "(Waveform · Freq Bands · Chroma · Waterfall · H/P)"
+        )
+        tel_btn.setFixedHeight(22)
+        tel_btn.setStyleSheet(
+            f"QPushButton {{ background:{C['deep']}; color:{C['lime']};"
+            f" border:1px solid rgba(0,229,255,0.2); border-radius:4px;"
+            f" padding:0 8px; font-size:11px; }}"
+            f"QPushButton:hover {{ border-color:{C['lime']};"
+            f" background:rgba(0,229,255,0.08); }}"
+        )
+        tel_btn.clicked.connect(self._telemetry.toggle)
+        sb.addPermanentWidget(tel_btn)
 
     def _wire_signals(self) -> None:
         t = self._transport
