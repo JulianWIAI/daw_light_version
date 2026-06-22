@@ -22,6 +22,7 @@ from typing import List, Optional
 
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QDialog,
     QFileDialog,
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSpacerItem,
@@ -95,6 +97,25 @@ QCheckBox::indicator:checked {{
     border-color: {_C["cyan"]};
 }}
 QCheckBox::indicator:hover {{
+    border-color: {_C["cyan"]};
+}}
+QRadioButton {{
+    color: {_C["text"]};
+    spacing: 8px;
+    font-size: 13px;
+}}
+QRadioButton::indicator {{
+    width: 14px;
+    height: 14px;
+    border: 1px solid rgba(0,229,255,0.35);
+    border-radius: 7px;
+    background: {_C["deep"]};
+}}
+QRadioButton::indicator:checked {{
+    background: {_C["cyan"]};
+    border-color: {_C["cyan"]};
+}}
+QRadioButton::indicator:hover {{
     border-color: {_C["cyan"]};
 }}
 QLabel {{
@@ -249,6 +270,45 @@ class ExportDialog(QDialog):
 
         root.addWidget(targets_box)
 
+        # ── Mastering flavor ─────────────────────────────────────────────────
+        flavor_box = QGroupBox("Mastering Flavor")
+        flavor_layout = QVBoxLayout(flavor_box)
+        flavor_layout.setSpacing(6)
+
+        flavor_desc = QLabel(
+            "Applied once to the raw mix before all targets."
+        )
+        flavor_desc.setStyleSheet(
+            f"color:{_C['text_dim']}; font-size:10px; background:transparent;"
+        )
+        flavor_layout.addWidget(flavor_desc)
+
+        self._flavor_btn_group = QButtonGroup(self)
+        self._flavor_radios: List[QRadioButton] = []
+        _flavor_data = [
+            (0, "Transparent",   "No color — flat signal path"),
+            (1, "Analog Warmth", "Soft saturation + high-shelf roll-off (−1 dB @ 12 kHz)"),
+            (2, "Club / Festival", "Low-shelf boost (+2 dB @ 50 Hz) + light VCA compression"),
+        ]
+        for fid, label, desc in _flavor_data:
+            rb = QRadioButton(label)
+            rb.setChecked(fid == 0)
+            self._flavor_btn_group.addButton(rb, fid)
+            self._flavor_radios.append(rb)
+
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            row.addWidget(rb)
+            tag = QLabel(desc)
+            tag.setStyleSheet(
+                f"color:{_C['text_dim']}; font-size:10px; background:transparent;"
+            )
+            tag.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            row.addWidget(tag, 1)
+            flavor_layout.addLayout(row)
+
+        root.addWidget(flavor_box)
+
         # ── Output folder ────────────────────────────────────────────────────
         folder_box = QGroupBox("Output")
         folder_layout = QVBoxLayout(folder_box)
@@ -370,6 +430,7 @@ class ExportDialog(QDialog):
             configs      = selected_configs,
             output_dir   = output_dir,
             project_name = project_name,
+            flavor_id    = self._flavor_btn_group.checkedId(),
             parent       = self,
         )
         self._worker.progress_updated.connect(self._on_progress)
@@ -427,6 +488,8 @@ class ExportDialog(QDialog):
         self._close_btn.setText("Cancel" if busy else "Close")
         for cb in self._checkboxes:
             cb.setEnabled(not busy)
+        for rb in self._flavor_radios:
+            rb.setEnabled(not busy)
         self._name_edit.setEnabled(not busy)
 
     def _stop_worker(self) -> None:

@@ -55,6 +55,9 @@ class SfzRealTimePlayer:
         self._pending: List[Tuple[str, int, int]] = []
         self._lock    = threading.Lock()
         self._stream: Optional[object] = None
+        # Optional telemetry sink — set by TelemetryManager after start().
+        # Called from the audio thread with a mono float32 numpy array.
+        self._telemetry_push = None
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -135,6 +138,12 @@ class SfzRealTimePlayer:
             outdata[:n, 1] = right[:n]
             if n < frames:
                 outdata[n:] = 0.0
+            # Push mono mix to telemetry analyzer if one is attached.
+            if self._telemetry_push is not None:
+                try:
+                    self._telemetry_push((left[:n] + right[:n]) * 0.5)
+                except Exception:
+                    pass
         except Exception as exc:
             logger.debug("SfzRealTimePlayer._callback error: %s", exc)
             outdata.fill(0.0)

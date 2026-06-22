@@ -404,13 +404,15 @@ class MasteringExportWorker(QThread):
         configs:      List[ExportConfig],
         output_dir:   str,
         project_name: str,
-        parent        = None,
+        flavor_id:    int  = 0,
+        parent             = None,
     ) -> None:
         super().__init__(parent)
         self._render_info  = render_info
         self._configs      = [c for c in configs if c.enabled]
         self._output_dir   = output_dir
         self._project_name = project_name or "export"
+        self._flavor_id    = max(0, min(2, int(flavor_id)))
 
     # ── QThread entry point ───────────────────────────────────────────────────
 
@@ -452,6 +454,15 @@ class MasteringExportWorker(QThread):
         if raw_mix is None:
             return False, "No audio found — nothing to export."
 
+        # Apply mastering flavor once on the shared render.
+        # All targets branch off the same flavored buffer.
+        _FLAVOR_NAMES = ("Transparent", "Analog Warmth", "Club/Festival")
+        if self._flavor_id != 0:
+            self.status_changed.emit(
+                f"Applying mastering flavor: {_FLAVOR_NAMES[self._flavor_id]}…"
+            )
+        flavored_mix = self._apply_flavor(raw_mix)
+
         n_targets    = len(self._configs)
         ok_count     = 0
         failed_names = []
@@ -466,7 +477,7 @@ class MasteringExportWorker(QThread):
                 f"[{idx + 1}/{n_targets}] Mastering: {cfg.target_name}…"
             )
 
-            ok = self._export_one_target(raw_mix, cfg, pipeline, idx, n_targets)
+            ok = self._export_one_target(flavored_mix, cfg, pipeline, idx, n_targets)
             if ok:
                 ok_count += 1
             else:
@@ -512,6 +523,44 @@ class MasteringExportWorker(QThread):
             ok = ok and self._export_stems(cfg, pipeline)
 
         return ok
+
+    # ── Mastering flavor (applied once, shared across all targets) ────────────
+
+    def _apply_flavor(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Apply the selected mastering flavor to the raw stereo mix.
+
+        Returns the input array unmodified for flavor 0 (TRANSPARENT).
+        Falls back gracefully if daw_processors is unavailable.
+        """
+        if self._flavor_id == 0:
+            return audio
+
+        if _DP_AVAILABLE and _dp is not None:
+            try:
+                proc = _dp.MasteringFlavorProcessor(float(EXPORT_SR))
+                proc.set_flavor(self._flavor_id)
+                n   = audio.shape[1]
+                out = np.zeros_like(audio)
+                for i in range(0, n, BLOCK_SIZE):
+                    j      = min(i + BLOCK_SIZE, n)
+                    l_in   = np.ascontiguousarray(audio[0, i:j], dtype=np.float32)
+                    r_in   = np.ascontiguousarray(audio[1, i:j], dtype=np.float32)
+                    pad    = BLOCK_SIZE - len(l_in)
+                    actual = len(l_in)
+                    if pad > 0:
+                        l_in = np.pad(l_in, (0, pad))
+                        r_in = np.pad(r_in, (0, pad))
+                    l_out, r_out = proc.process_block(l_in, r_in)
+                    out[0, i:i + actual] = l_out[:actual]
+                    out[1, i:i + actual] = r_out[:actual]
+                return out
+            except Exception as exc:
+                logger.debug(
+                    "MasteringFlavorProcessor failed: %s — skipping flavor.", exc
+                )
+
+        return audio  # C++ unavailable: pass through
 
     # ── Master chain ──────────────────────────────────────────────────────────
 

@@ -76,11 +76,15 @@ from .master_bus_channel import MasterBusChannel
 from .sfz_engine_python import get_sfz_engine, parse_sfz
 from .sfz_panel import SfzKeyRangeWidget
 from .sfz_realtime_player import SfzRealTimePlayer
+from .gm_defaults_dialog import GmDefaultsDialog
+from .gm_defaults_manager import GmDefaultsManager
+from .midi_drop_importer import _parse_midi_file
 # Decent Sampler (.dspreset) support — parser, GUI panel, engine factory, player.
 from .dspreset_parser import parse_dspreset
 from .dspreset_panel import DsPresetPanel
 from .dspreset_engine import get_ds_engine, load_preset_into_engine
 from .dspreset_realtime_player import DsRealTimePlayer
+from .telemetry_manager import TelemetryManager
 
 logger = logging.getLogger(__name__)
 
@@ -4550,6 +4554,10 @@ class MainWindow(QMainWindow):
         # Export worker reference -- kept alive to prevent mid-run GC.
         self._export_worker = None
 
+        # Real-time audio telemetry — TelemetryManager owns the C++ analyzer,
+        # five QDockWidget panels, and the 30-FPS polling loop.
+        self._telemetry = TelemetryManager(self)
+
         # C++ timeline engine bridge — handles MIDI scheduling and audio mixing.
         # Initialised before the toolbar so BPM changes from the transport bar
         # can propagate to the bridge immediately.
@@ -4570,6 +4578,9 @@ class MainWindow(QMainWindow):
         self._setup_effects_dock()
         self._setup_status_bar()
         self._wire_signals()
+        # Telemetry dock widgets are created after the main layout is complete
+        # so addDockWidget() has a valid main window area to place them in.
+        self._telemetry.setup_docks()
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(50)
@@ -4704,6 +4715,9 @@ class MainWindow(QMainWindow):
         tb.addWidget(_btn("🎵+ IMPORT AUDIO",
                           "Add multiple audio files — each gets its own track",
                           self._on_import_audio_files, C["gold"]))
+        tb.addWidget(_btn("🎹 GM DEFAULTS",
+                          "Set default SFZ / VST3 instruments for MIDI drag-and-drop",
+                          self._on_gm_defaults, C["purple"]))
         tb.addWidget(_btn("🎵 EXPORT",      "Export to WAV or MP3",
                           self._on_export, C["gold"]))
         tb.addWidget(_btn("🎚 MASTER",      "Multi-format mastering export (MP3 / WAV / Stems)",
@@ -4713,6 +4727,11 @@ class MainWindow(QMainWindow):
                           self._on_connect_gamepad))
         tb.addWidget(_btn("⌨ KEY MAP",      "Show keyboard mapping",
                           self._on_show_map))
+        tb.addSeparator()
+        tb.addWidget(_btn("📊 TELEMETRY",
+                          "Show / hide real-time audio telemetry panels\n"
+                          "(Waveform · Freq Bands · Chroma · Waterfall · H/P)",
+                          self._telemetry.toggle, C["lime"]))
 
     def _setup_transport(self) -> None:
         self._transport = TransportBar()
@@ -5413,6 +5432,51 @@ class MainWindow(QMainWindow):
             self._mixer_strips[track.channel] = strip
             self._mixer_layout.addWidget(strip)
 
+        # Auto-load SFZ instruments for every imported MIDI track.
+        # _parse_midi_file extracts the GM program ID from the file and maps it
+        # to an SFZ path via GmDefaultsManager.  We match payloads → MidiTrack
+        # objects by track name (both readers use the same MIDI track_name meta).
+        if midi_tracks:
+            _gm_mgr    = GmDefaultsManager()
+            _overrides = _gm_mgr.load()
+            # Build a name→MidiTrack lookup for fast matching.
+            _name_to_track = {t.name: t for t in midi_tracks}
+            _sf2_files = AudioEngine.get_available_sf2_files()
+            _sf2       = _sf2_files[0] if _sf2_files else ""
+            midi_paths = [p for p in paths if detect_file_type(p) == "midi"]
+            for mpath in midi_paths:
+                result = _parse_midi_file(mpath, _overrides)
+                if result is None:
+                    continue
+                _bpm, payloads = result
+                for payload in payloads:
+                    track = _name_to_track.get(payload.name)
+                    if track is None:
+                        continue
+                    sfz = payload.sfz_path
+                    if sfz and os.path.isfile(sfz):
+                        self._start_sfz_player(track.channel, sfz)
+                        # Wire telemetry push for this SFZ player.
+                        _pl = self._sfz_engines.get(track.channel)
+                        if _pl is not None:
+                            _pl._telemetry_push = self._telemetry.push_audio
+                    else:
+                        logger.warning(
+                            "_on_files_dropped: SFZ not found for track '%s' "
+                            "(gm_id=%d, path=%s)",
+                            payload.name, payload.gm_program_id, sfz,
+                        )
+                    # Register a FluidSynth fallback so mastering export works.
+                    if _sf2:
+                        _drums  = (payload.gm_program_id == 128)
+                        _preset = 0 if _drums else payload.gm_program_id
+                        _fb     = InstrumentPlugin(
+                            name=payload.name, sf2_path=_sf2,
+                            bank=128 if _drums else 0, preset=_preset,
+                            channel=track.channel,
+                        )
+                        self._engine.register_instrument(_fb)
+
         # Register new audio tracks with the player.
         for atrack in audio_tracks:
             self._register_audio_track_with_player(atrack.track_id)
@@ -5449,6 +5513,41 @@ class MainWindow(QMainWindow):
             strip = self._make_mixer_strip(track.channel, track.name, col)
             self._mixer_strips[track.channel] = strip
             self._mixer_layout.addWidget(strip)
+
+        # Auto-load SFZ instruments (same logic as _on_files_dropped).
+        if new_tracks:
+            _gm_mgr    = GmDefaultsManager()
+            _overrides = _gm_mgr.load()
+            _name_to_track = {t.name: t for t in new_tracks}
+            _sf2_files = AudioEngine.get_available_sf2_files()
+            _sf2       = _sf2_files[0] if _sf2_files else ""
+            for mpath in paths:
+                result = _parse_midi_file(mpath, _overrides)
+                if result is None:
+                    continue
+                _bpm, payloads = result
+                for payload in payloads:
+                    track = _name_to_track.get(payload.name)
+                    if track is None:
+                        continue
+                    sfz = payload.sfz_path
+                    if sfz and os.path.isfile(sfz):
+                        self._start_sfz_player(track.channel, sfz)
+                        # Wire telemetry push for this SFZ player.
+                        _pl = self._sfz_engines.get(track.channel)
+                        if _pl is not None:
+                            _pl._telemetry_push = self._telemetry.push_audio
+                    # Register a FluidSynth fallback so mastering export works
+                    # even when the real-time player is SFZ / DS / VST3.
+                    if _sf2:
+                        _drums  = (payload.gm_program_id == 128)
+                        _preset = 0 if _drums else payload.gm_program_id
+                        _fb     = InstrumentPlugin(
+                            name=payload.name, sf2_path=_sf2,
+                            bank=128 if _drums else 0, preset=_preset,
+                            channel=track.channel,
+                        )
+                        self._engine.register_instrument(_fb)
 
         self._refresh_piano_roll()
 
@@ -5968,10 +6067,35 @@ class MainWindow(QMainWindow):
         if not info:
             return
 
-        kind = info[0]
+        kind  = info[0]
         strip = self._mixer_strips.get(channel)
 
+        # Helper: stop and unregister SFZ player for this channel (if any).
+        def _stop_sfz():
+            old = self._sfz_engines.pop(channel, None)
+            if old is not None:
+                self._engine.unregister_sfz_player(channel)
+                try:
+                    old.stop()
+                except Exception:
+                    pass
+
+        # Helper: stop and unregister DS player for this channel (if any).
+        def _stop_ds():
+            old = self._ds_engines.pop(channel, None)
+            if old is not None:
+                self._engine.unregister_ds_player(channel)
+                try:
+                    old.stop()
+                except Exception:
+                    pass
+
         if kind == "sf2":
+            # When switching back to SF2, the SFZ / DS players must be stopped
+            # first — they have routing priority and would otherwise silence the
+            # new FluidSynth selection.
+            _stop_sfz()
+            _stop_ds()
             _, sf2, bank, preset, preset_name = info
             self._instrument_names[channel] = preset_name
             plugin = InstrumentPlugin(
@@ -5987,6 +6111,9 @@ class MainWindow(QMainWindow):
                 f"Instrument changed → '{preset_name}'  (CH {channel + 1})")
 
         elif kind == "sfz":
+            # Stop any DS player — SFZ and DS would both claim real-time output.
+            # The existing SFZ player (if any) is cleaned up inside _start_sfz_player.
+            _stop_ds()
             _, sfz_path, name = info
             self._instrument_names[channel] = name
             self._start_sfz_player(channel, sfz_path)
@@ -5998,6 +6125,9 @@ class MainWindow(QMainWindow):
                 f"SFZ instrument loaded → '{name}'  (CH {channel + 1})")
 
         elif kind == "vst3":
+            # VST3 takes priority over all other players; stop SFZ and DS.
+            _stop_sfz()
+            _stop_ds()
             _, plugin_path, plugin_name = info
             self._instrument_names[channel] = plugin_name
             if strip:
@@ -6008,8 +6138,8 @@ class MainWindow(QMainWindow):
                 f"VST3 plugin assigned → '{plugin_name}'  (CH {channel + 1})")
 
         elif kind == "ds":
-            # Decent Sampler: load the .dspreset, start the audio player,
-            # and wire the DS panel to show the preset's knobs/sliders.
+            # Stop any SFZ player; DS handles its own SFZ → DS cleanup.
+            _stop_sfz()
             _, ds_path, ds_name = info
             self._instrument_names[channel] = ds_name
             self._start_ds_player(channel, ds_path)
@@ -6188,6 +6318,8 @@ class MainWindow(QMainWindow):
         player = SfzRealTimePlayer(sfz_engine)
         if not player.start():
             logger.warning("SFZ player could not start audio stream for CH %d", channel)
+        # Wire telemetry push so the analyzer receives rendered audio.
+        player._telemetry_push = self._telemetry.push_audio
         self._sfz_engines[channel] = player
         self._engine.register_sfz_player(channel, player)
 
@@ -6873,8 +7005,45 @@ class MainWindow(QMainWindow):
         for ch, chain in self._effect_chains.items():
             self._engine.apply_effect_chain(chain)
 
+        # Load GM-appropriate SFZ instruments for real-time playback.
+        # _parse_midi_file extracts each track's GM program ID and resolves
+        # the matching SFZ path via GmDefaultsManager.
+        # We match payloads to DAW tracks by the MIDI channel carried on the
+        # first event — that channel is the same as track.channel in the old
+        # importer which groups events by MIDI channel.
+        _overrides = GmDefaultsManager().load()
+        _parsed    = _parse_midi_file(path, _overrides)
+        if _parsed:
+            _, _payloads     = _parsed
+            _loaded_channels : set = set()
+            for _pl in _payloads:
+                if not _pl.events:
+                    continue
+                # Use the MIDI channel embedded in the event stream.
+                _ch = _pl.events[0].channel
+                if _ch in _loaded_channels:
+                    continue   # already loaded the SFZ for this channel
+                _loaded_channels.add(_ch)
+                _sfz = _pl.sfz_path
+                if _sfz and os.path.isfile(_sfz):
+                    self._start_sfz_player(_ch, _sfz)
+                    # Wire telemetry push so the waveform / band panels update
+                    # while the user plays back through the SFZ engine.
+                    player = self._sfz_engines.get(_ch)
+                    if player is not None:
+                        player._telemetry_push = self._telemetry.push_audio
+
         self._refresh_piano_roll()
         self._st_engine.setText(f"Opened: {os.path.basename(path)}")
+
+    @Slot()
+    def _on_gm_defaults(self) -> None:
+        """Open the GM instrument defaults settings dialog."""
+        dlg = GmDefaultsDialog(parent=self)
+        dlg.defaults_changed.connect(
+            lambda: self._st_engine.setText("GM instrument defaults saved.")
+        )
+        dlg.exec()
 
     @Slot()
     def _on_export(self) -> None:
@@ -6999,6 +7168,22 @@ class MainWindow(QMainWindow):
             return result
 
         # ── MIDI tracks ───────────────────────────────────────────────────────
+        # Pre-scan: warn about any tracks that have no SF2 fallback registered.
+        # SFZ / DS / VST3 real-time players cannot be used in the offline render;
+        # the import handlers register a FluidSynth fallback for exactly this case.
+        _skipped_names: list = []
+        for _mt in self._midi.get_all_tracks():
+            if not list(_mt.notes):
+                continue
+            _pl = instruments.get(_mt.channel)
+            if _pl is None or not _pl.sf2_path:
+                _skipped_names.append(_mt.name or f"CH {_mt.channel + 1}")
+        if _skipped_names:
+            logger.warning(
+                "_on_master_export: %d track(s) have no SF2 fallback and will "
+                "be skipped: %s", len(_skipped_names), ", ".join(_skipped_names)
+            )
+
         midi_tracks: list = []
         for mtrack in self._midi.get_all_tracks():
             notes = list(mtrack.notes)
@@ -7006,7 +7191,7 @@ class MainWindow(QMainWindow):
                 continue
             plugin = instruments.get(mtrack.channel)
             if plugin is None or not plugin.sf2_path:
-                continue   # can't synthesise without a soundfont
+                continue   # no SF2 fallback — already warned above
 
             # Update project duration estimate.
             for note in notes:

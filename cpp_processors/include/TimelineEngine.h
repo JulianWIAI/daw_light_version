@@ -52,8 +52,9 @@
 #include <string>
 #include <vector>
 
-#include "DspHelpers.h"   // MAX_BLOCK_SIZE
-#include "Sampler.h"      // polyphonic sample-playback instrument
+#include "DspHelpers.h"        // MAX_BLOCK_SIZE
+#include "MidiDropImporter.h"  // MidiTrackPayload, MidiNoteEvent, MidiDropImporter
+#include "Sampler.h"           // polyphonic sample-playback instrument
 
 // =============================================================================
 // MIDI event record
@@ -299,6 +300,37 @@ public:
                      int midi_root_note = 60);
 
     // -------------------------------------------------------------------------
+    // Multi-track MIDI drag-and-drop import  (async, thread-safe)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Asynchronously import a collection of pre-parsed MIDI tracks.
+     *
+     * Returns immediately — the actual track creation runs on a background
+     * thread inside the owned MidiDropImporter.  The caller's *payloads*
+     * vector is deep-copied before this function returns so the Python list
+     * may be garbage-collected right away.
+     *
+     * @param payloads  Per-track data assembled by Python / mido.
+     * @param on_done   Optional callback fired on the importer thread when
+     *                  all tracks have been created (arg = success flag).
+     */
+    void importMultiTrackMidi(
+        const std::vector<MidiTrackPayload>& payloads,
+        std::function<void(bool)>            on_done = nullptr
+    );
+
+    /** True while the background import thread is still running (atomic load). */
+    bool is_import_busy() const noexcept;
+
+    /**
+     * Poll for import completion.  Call once per audio block from the audio
+     * callback.  Returns true exactly once after each successful import.
+     * Zero allocations — see MidiDropImporter::check_import_ready().
+     */
+    bool check_import_ready();
+
+    // -------------------------------------------------------------------------
     // Pending MIDI event queue  (audio callback → Python)
     // -------------------------------------------------------------------------
 
@@ -376,4 +408,7 @@ private:
      * at any moment.  Pre-allocated so process_block_into() is allocation-free. */
     float _scratch_left [MAX_BLOCK_SIZE];
     float _scratch_right[MAX_BLOCK_SIZE];
+
+    /* Async MIDI drag-and-drop importer — created lazily on first use. */
+    std::unique_ptr<MidiDropImporter> _midi_importer;
 };

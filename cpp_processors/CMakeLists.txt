@@ -151,11 +151,21 @@ pybind11_add_module(daw_processors
     src/DecentSamplerEngine.cpp
     # VST3 multi-bus topology manager (stub if no SDK)
     src/Vst3BusManager.cpp
+    # Async multi-track MIDI drag-and-drop import
+    src/MidiDropImporter.cpp
+    src/TimelineEngine_MidiDrop.cpp
+    # Offline mastering flavor processor (tanh saturation, biquad EQ, VCA compressor)
+    src/MasteringFlavorProcessor.cpp
+    # Real-time audio telemetry analyzer (RMS, FFT, chroma, HPSS)
+    src/TelemetryAnalyzer.cpp
     # Split pybind11 binding modules (keep bindings.cpp manageable)
     src/bindings_sfz.cpp
     src/bindings_vst3.cpp
     src/bindings_ds.cpp
-    # pybind11 module entry point (calls bind_sfz / bind_vst3_extensions / bind_ds)
+    src/bindings_midi_drop.cpp
+    src/bindings_flavor.cpp
+    src/bindings_telemetry.cpp
+    # pybind11 module entry point (calls bind_sfz / bind_vst3_extensions / bind_ds / bind_midi_drop / bind_telemetry)
     src/bindings.cpp
 )
 

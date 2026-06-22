@@ -79,6 +79,17 @@ void bind_sfz            (py::module_& m);
 void bind_vst3_extensions(py::module_& m);
 void bind_ds             (py::module_& m);
 
+// Multi-track MIDI drag-and-drop import bindings.
+// Signature takes the existing TimelineEngine class handle so it can append
+// importMultiTrackMidi / is_import_busy / check_import_ready as .def() calls.
+void bind_midi_drop(py::module_& m, py::class_<TimelineEngine>& tl_cls);
+
+// Offline mastering flavor processor (MasteringFlavor enum + MasteringFlavorProcessor).
+void bind_flavor(py::module_& m);
+
+// Real-time audio telemetry (TelemetryFrame + TelemetryAnalyzer).
+void bind_telemetry(py::module_& m);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Generic process_block wrapper
 // Returns a pair of new numpy arrays containing the processed audio so the
@@ -834,7 +845,9 @@ PYBIND11_MODULE(daw_processors, m) {
         });
 
     // ── TimelineEngine ────────────────────────────────────────────────────────
-    py::class_<TimelineEngine>(m, "TimelineEngine",
+    // Captured as a variable so bind_midi_drop() can append .def() calls for
+    // importMultiTrackMidi / is_import_busy / check_import_ready.
+    auto timeline_cls = py::class_<TimelineEngine>(m, "TimelineEngine",
         "Zero-allocation C++ real-time audio/MIDI timeline engine.\n\n"
         "Audio callback thread: process_block_into(), pop_midi_events(),\n"
         "                       current_frame(), current_beat(), is_playing().\n"
@@ -1036,6 +1049,16 @@ PYBIND11_MODULE(daw_processors, m) {
              "Both arrays must be contiguous, writable, 1-D float32 and equal length\n"
              "(≤ 4096 = MAX_BLOCK_SIZE).  The GIL is released during C++ processing\n"
              "so other Python threads remain unblocked.");
+
+    // ── Multi-track MIDI drag-and-drop import ─────────────────────────────────
+    // Appends importMultiTrackMidi / is_import_busy / check_import_ready to the
+    // TimelineEngine class, and registers MidiNoteEvent, MidiTrackPayload, and
+    // the gm_to_sfz_path() helper on the module.
+    bind_midi_drop(m, timeline_cls);
+
+    // ── Offline mastering flavor processor ────────────────────────────────────
+    // Registers MasteringFlavor enum and MasteringFlavorProcessor class.
+    bind_flavor(m);
 
     // ─────────────────────────────────────────────────────────────────────────
     // WaveformGenerator  --  fast peak-array generation for waveform display
@@ -1727,4 +1750,7 @@ PYBIND11_MODULE(daw_processors, m) {
 
     // ── Decent Sampler engine + VST3 bus manager ─────────────────────────────
     bind_ds(m);
+
+    // ── Real-time audio telemetry (RMS, FFT bands, chroma, HPSS) ─────────────
+    bind_telemetry(m);
 }
