@@ -64,13 +64,15 @@ def main() -> int:
     log = logging.getLogger(__name__)
     log.info("=== SBS-Synth Master starting ===")
 
+    # Must be set before QApplication is constructed.
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+
     # QApplication must be created before any QWidget.
     app = QApplication(sys.argv)
     app.setApplicationName("SBS-Synth Master")
     app.setOrganizationName("SBS Studio")
-    app.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
 
     icon_path = os.path.join(os.path.dirname(__file__), "assets", "icons", "icon.png")
     if os.path.exists(icon_path):
@@ -99,6 +101,9 @@ def main() -> int:
     engine._telemetry_push = window._telemetry.push_audio
 
     window.show()
+    window.raise_()
+    window.activateWindow()
+    app.processEvents()
 
     log.info("Window ready — entering Qt event loop.")
     exit_code = app.exec()

@@ -4578,8 +4578,6 @@ class MainWindow(QMainWindow):
         self._setup_effects_dock()
         self._setup_status_bar()
         self._wire_signals()
-        # Telemetry dock widgets are created after the main layout is complete
-        # so addDockWidget() has a valid main window area to place them in.
         self._telemetry.setup_docks()
 
         self._refresh_timer = QTimer(self)
@@ -4593,29 +4591,14 @@ class MainWindow(QMainWindow):
 
     def _init_audio_clip_playback(self) -> None:
         """
-        Initialise pygame.mixer and wire the AudioFilePlayer as the audio callback.
-
-        AudioFilePlayer.play_clip() is called by MidiLogic for every audio clip
-        that fires during playback. It handles per-track DSP effects, volume,
-        and pan before handing the processed audio to a dedicated pygame channel.
+        Wire audio-clip callbacks into MidiLogic.  pygame.mixer is intentionally
+        skipped — sounddevice already owns CoreAudio on macOS (and WASAPI on
+        Windows), so initialising pygame.mixer would block indefinitely.
+        AudioFilePlayer falls back to sounddevice when pygame is unavailable.
         """
-        try:
-            import pygame
-            pygame.mixer.pre_init(44100, -16, 2, 4096)
-            pygame.mixer.init()
-            # AudioFilePlayer was constructed before pygame.mixer.init() ran, so its
-            # first _init_pygame() attempt silently failed.  Re-run it now that the
-            # mixer is ready so _pygame_ok becomes True and channel allocation works.
-            self._audio_player._init_pygame()
-            # Register the clip-start callback (track_id, path, duration_secs, offset).
-            self._midi.set_audio_callback(self._play_audio_file)
-            # Register the stop-all callback so AudioLoopScheduler can halt
-            # playing clips at the precise loop boundary.
-            self._midi.set_stop_audio_callback(self._audio_player.stop_all)
-            logger.info("pygame.mixer initialised for audio clip playback.")
-        except Exception as exc:
-            logger.warning(
-                "pygame.mixer init failed -- audio clips will be silent: %s", exc)
+        self._midi.set_audio_callback(self._play_audio_file)
+        self._midi.set_stop_audio_callback(self._audio_player.stop_all)
+        logger.info("Audio clip playback wired (sounddevice backend).")
 
     def _init_timeline_bridge(self) -> None:
         """

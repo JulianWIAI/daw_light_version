@@ -716,20 +716,26 @@ class AudioEngine:
         Scan common paths for SoundFont (.sf2) files and return their paths.
 
         Searches in this order:
-            1. assets/soundfonts/ next to this module.
-            2. /usr/share/sounds/sf2/ (Linux distributions).
-            3. ~/Library/Audio/Sounds/Banks/ (macOS user sounds).
-            4. /Library/Audio/Sounds/Banks/ (macOS system sounds).
+            1. soundfonts/ at the project root  ← drop your SF2 here
+            2. assets/soundfonts/ next to this module.
+            3. /usr/share/sounds/sf2/ (Linux).
+            4. ~/Library/Audio/Sounds/Banks/ (macOS user sounds).
+            5. /Library/Audio/Sounds/Banks/ (macOS system sounds).
+            6. %LOCALAPPDATA%\soundfonts\ (Windows user).
+            7. C:\soundfonts\ (Windows shared).
 
         Returns:
             List of absolute paths to discovered .sf2 files.
         """
         project_root = os.path.dirname(os.path.dirname(__file__))
         search_dirs = [
+            os.path.join(project_root, "soundfonts"),
             os.path.join(project_root, "assets", "soundfonts"),
             "/usr/share/sounds/sf2",
             os.path.expanduser("~/Library/Audio/Sounds/Banks"),
             "/Library/Audio/Sounds/Banks",
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "soundfonts"),
+            r"C:\soundfonts",
         ]
         found: List[str] = []
         for directory in search_dirs:
