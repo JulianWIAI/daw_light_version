@@ -715,35 +715,55 @@ class AudioEngine:
         """
         Scan common paths for SoundFont (.sf2) files and return their paths.
 
-        Searches in this order:
-            1. soundfonts/ at the project root  ← drop your SF2 here
-            2. assets/soundfonts/ next to this module.
-            3. /usr/share/sounds/sf2/ (Linux).
-            4. ~/Library/Audio/Sounds/Banks/ (macOS user sounds).
-            5. /Library/Audio/Sounds/Banks/ (macOS system sounds).
-            6. %LOCALAPPDATA%\soundfonts\ (Windows user).
-            7. C:\soundfonts\ (Windows shared).
-
-        Returns:
-            List of absolute paths to discovered .sf2 files.
+        Priority order:
+            1.  soundfonts/        — project root  (drop your SF2 here)
+            2.  assets/soundfonts/ — bundled assets
+            3.  /usr/share/sounds/sf2/          (Linux system)
+            4.  ~/Library/Audio/Sounds/Banks/   (macOS user)
+            5.  /Library/Audio/Sounds/Banks/    (macOS system)
+            6.  %LOCALAPPDATA%\\soundfonts\\    (Windows per-user)
+            7.  C:\\soundfonts\\                (Windows shared)
+            8.  ~/Downloads/                    (flat scan, Windows/macOS/Linux)
+            9.  ~/Documents/soundfonts/
+            10. ~/Music/soundfonts/             (macOS GarageBand convention)
         """
         project_root = os.path.dirname(os.path.dirname(__file__))
+        home = os.path.expanduser("~")
         search_dirs = [
+            # Project-local (highest priority — always checked first)
             os.path.join(project_root, "soundfonts"),
             os.path.join(project_root, "assets", "soundfonts"),
+            # Linux system
             "/usr/share/sounds/sf2",
-            os.path.expanduser("~/Library/Audio/Sounds/Banks"),
+            # macOS
+            os.path.join(home, "Library", "Audio", "Sounds", "Banks"),
             "/Library/Audio/Sounds/Banks",
+            os.path.join(home, "Music", "soundfonts"),
+            # Windows
             os.path.join(os.environ.get("LOCALAPPDATA", ""), "soundfonts"),
+            os.path.join(os.environ.get("APPDATA", ""), "soundfonts"),
             r"C:\soundfonts",
+            # Common download / document locations (flat scan only — no recursion)
+            os.path.join(home, "Downloads"),
+            os.path.join(home, "Documents"),
+            os.path.join(home, "Documents", "soundfonts"),
+            os.path.join(home, "Documents", "SoundFonts"),
         ]
+        seen: set = set()
         found: List[str] = []
         for directory in search_dirs:
             if not os.path.isdir(directory):
                 continue
-            for fname in sorted(os.listdir(directory)):
+            try:
+                entries = sorted(os.listdir(directory))
+            except PermissionError:
+                continue
+            for fname in entries:
                 if fname.lower().endswith(".sf2"):
-                    found.append(os.path.join(directory, fname))
+                    full = os.path.normpath(os.path.join(directory, fname))
+                    if full not in seen:
+                        seen.add(full)
+                        found.append(full)
         return found
 
     # ------------------------------------------------------------------

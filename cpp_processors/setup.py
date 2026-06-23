@@ -56,8 +56,18 @@ SOURCES = [
     str(BASE / "src" / "OfflineExporter.cpp"),
     # Real-time timeline / transport engine
     str(BASE / "src" / "TimelineEngine.cpp"),
-    # pybind11 module entry point
+    str(BASE / "src" / "TimelineEngine_MidiDrop.cpp"),
+    # Mastering flavor processor
+    str(BASE / "src" / "MasteringFlavorProcessor.cpp"),
+    # MIDI drag-and-drop importer
+    str(BASE / "src" / "MidiDropImporter.cpp"),
+    # Real-time audio telemetry analyzer (FFT, bands, chroma, HPSS)
+    str(BASE / "src" / "TelemetryAnalyzer.cpp"),
+    # pybind11 module entry point + split binding modules
     str(BASE / "src" / "bindings.cpp"),
+    str(BASE / "src" / "bindings_flavor.cpp"),
+    str(BASE / "src" / "bindings_midi_drop.cpp"),
+    str(BASE / "src" / "bindings_telemetry.cpp"),
 ]
 
 # Compiler-specific optimisation flags.

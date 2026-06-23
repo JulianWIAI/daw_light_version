@@ -6965,12 +6965,31 @@ class MainWindow(QMainWindow):
         sf2_files = AudioEngine.get_available_sf2_files()
         sf2 = sf2_files[0] if sf2_files else ""
 
+        # Parse the MIDI file once to get GM program IDs and SFZ paths for
+        # every channel — used for both SF2 preset selection and SFZ loading.
+        _overrides = GmDefaultsManager().load()
+        _parsed    = _parse_midi_file(path, _overrides)
+        # Build channel → (gm_program_id, sfz_path) lookup from parsed payloads.
+        _ch_gm: dict = {}   # channel → gm_program_id
+        _ch_sfz: dict = {}  # channel → sfz_path
+        if _parsed:
+            _, _payloads = _parsed
+            for _pl in _payloads:
+                if not _pl.events:
+                    continue
+                _ch = _pl.events[0].channel
+                if _ch not in _ch_gm:
+                    _ch_gm[_ch]  = _pl.gm_program_id
+                    _ch_sfz[_ch] = _pl.sfz_path
+
         for track in self._midi.get_all_tracks():
             track.color = C["tracks"][track.channel % len(C["tracks"])]
-            is_drums = (track.channel == 9)
+            gm_id    = _ch_gm.get(track.channel, 0)
+            is_drums = (track.channel == 9) or (gm_id == 128)
             plugin = InstrumentPlugin(
                 name=track.name, sf2_path=sf2,
-                bank=128 if is_drums else 0, preset=0,
+                bank=128 if is_drums else 0,
+                preset=0 if is_drums else gm_id,
                 channel=track.channel,
             )
             if sf2:
@@ -6992,38 +7011,22 @@ class MainWindow(QMainWindow):
         if self._midi.get_all_tracks():
             self._on_track_selected(self._midi.get_all_tracks()[0].channel)
 
-        # Apply all effect chains now — this zeros reverb/chorus so the
-        # imported MIDI doesn't play with FluidSynth's default heavy reverb.
+        # Apply all effect chains — zeros reverb/chorus so the imported MIDI
+        # doesn't play with FluidSynth's default heavy reverb.
         for ch, chain in self._effect_chains.items():
             self._engine.apply_effect_chain(chain)
 
         # Load GM-appropriate SFZ instruments for real-time playback.
-        # _parse_midi_file extracts each track's GM program ID and resolves
-        # the matching SFZ path via GmDefaultsManager.
-        # We match payloads to DAW tracks by the MIDI channel carried on the
-        # first event — that channel is the same as track.channel in the old
-        # importer which groups events by MIDI channel.
-        _overrides = GmDefaultsManager().load()
-        _parsed    = _parse_midi_file(path, _overrides)
-        if _parsed:
-            _, _payloads     = _parsed
-            _loaded_channels : set = set()
-            for _pl in _payloads:
-                if not _pl.events:
-                    continue
-                # Use the MIDI channel embedded in the event stream.
-                _ch = _pl.events[0].channel
-                if _ch in _loaded_channels:
-                    continue   # already loaded the SFZ for this channel
-                _loaded_channels.add(_ch)
-                _sfz = _pl.sfz_path
-                if _sfz and os.path.isfile(_sfz):
-                    self._start_sfz_player(_ch, _sfz)
-                    # Wire telemetry push so the waveform / band panels update
-                    # while the user plays back through the SFZ engine.
-                    player = self._sfz_engines.get(_ch)
-                    if player is not None:
-                        player._telemetry_push = self._telemetry.push_audio
+        _loaded_channels: set = set()
+        for _ch, _sfz in _ch_sfz.items():
+            if _ch in _loaded_channels:
+                continue
+            _loaded_channels.add(_ch)
+            if _sfz and os.path.isfile(_sfz):
+                self._start_sfz_player(_ch, _sfz)
+                player = self._sfz_engines.get(_ch)
+                if player is not None:
+                    player._telemetry_push = self._telemetry.push_audio
 
         self._refresh_piano_roll()
         self._st_engine.setText(f"Opened: {os.path.basename(path)}")
