@@ -100,7 +100,7 @@ def main() -> int:
     # played via FluidSynth (SF2) is captured alongside SFZ/DS streams.
     engine._telemetry_push = window._telemetry.push_audio
 
-    window.show()
+    window.showMaximized()
     window.raise_()
     window.activateWindow()
     app.processEvents()

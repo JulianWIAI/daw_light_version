@@ -4689,11 +4689,9 @@ class MainWindow(QMainWindow):
         tb.addWidget(_btn("💾 SAVE MIDI",   "Export tracks to .mid",
                           self._on_save_midi))
         tb.addWidget(_btn("📂 LOAD MIDI",
-                          "Replace project with one MIDI file",
-                          self._on_open_midi))
-        tb.addWidget(_btn("📂+ IMPORT MIDI",
-                          "Add MIDI file(s) to the current project "
-                          "(each file keeps its own tracks)",
+                          "Import MIDI file(s) — each track gets its own "
+                          "GM instrument automatically. Use NEW PROJECT first "
+                          "to replace the current project.",
                           self._on_import_midi_files, C["cyan"]))
         tb.addWidget(_btn("🎵+ IMPORT AUDIO",
                           "Add multiple audio files — each gets its own track",
