@@ -38,7 +38,7 @@ import json
 import logging
 import os
 from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +154,7 @@ class GmDefaultsManager:
 
     # ── IO ────────────────────────────────────────────────────────────────────
 
-    def load(self) -> Dict[str, str]:
+    def load(self) -> Dict[str, Any]:
         """
         Read user overrides from disk.
 
@@ -169,29 +169,41 @@ class GmDefaultsManager:
         try:
             with open(self.SETTINGS_FILE, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            # Keep only recognised keys with non-empty string values.
-            return {
-                k: v for k, v in data.items()
-                if k in GM_CATEGORIES and isinstance(v, str) and v.strip()
-            }
+            result = {}
+            for k, v in data.items():
+                if k not in GM_CATEGORIES:
+                    continue
+                if isinstance(v, str) and v.strip():
+                    result[k] = v  # backward-compat plain SFZ path
+                elif isinstance(v, dict) and v.get("type") and v.get("path"):
+                    result[k] = v  # new-style override dict
+            return result
         except Exception as exc:
             logger.warning("gm_defaults_manager: could not load '%s': %s",
                            self.SETTINGS_FILE, exc)
             return {}
 
-    def save(self, overrides: Dict[str, str]) -> None:
+    def save(self, overrides: Dict[str, Any]) -> None:
         """
         Persist user overrides to disk.
 
-        Only entries with a non-empty path value are written; this keeps the
-        file small and lets future code add new categories without breaking
-        existing settings.
+        Values may be a plain SFZ path string (backward compat) or a dict of
+        the form ``{"type": "sfz"|"sf2"|"vst3", "path": ..., ...}``.  Only
+        entries with a non-empty path are written.
 
         Args:
-            overrides: ``{key: path}`` dict.  Pass ``{}`` to clear all overrides.
+            overrides: ``{key: entry}`` dict.  Pass ``{}`` to clear all overrides.
         """
         os.makedirs(self.SETTINGS_DIR, exist_ok=True)
-        clean = {k: v for k, v in overrides.items() if v and v.strip()}
+
+        def _is_valid(v: Any) -> bool:
+            if isinstance(v, str):
+                return bool(v.strip())
+            if isinstance(v, dict):
+                return bool(v.get("path", ""))
+            return False
+
+        clean = {k: v for k, v in overrides.items() if _is_valid(v)}
         try:
             with open(self.SETTINGS_FILE, "w", encoding="utf-8") as fh:
                 json.dump(clean, fh, indent=2, ensure_ascii=False)
@@ -248,8 +260,35 @@ class GmDefaultsManager:
         """
         if overrides is None:
             overrides = self.load()
-        key  = self.get_category_key(gm_id)
-        path = overrides.get(key, "")
-        if path and path.strip():
-            return path
+        key = self.get_category_key(gm_id)
+        raw = overrides.get(key, "")
+        if isinstance(raw, str) and raw.strip():
+            return raw
+        if isinstance(raw, dict) and raw.get("type") == "sfz":
+            return raw.get("path", "")
         return self.get_default_path(key)
+
+    def get_override_entry(self, gm_id: int,
+                           overrides: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Return the full override dict for *gm_id*, or ``None`` if no override.
+
+        The returned dict always has the shape::
+
+            {"type": "sfz"|"sf2"|"vst3", "path": str, ...}
+
+        For SF2 entries it additionally contains ``"bank"`` and ``"preset"`` keys.
+        Old-style plain-string values (written by earlier versions) are treated
+        as SFZ entries for backward compatibility.
+        """
+        if overrides is None:
+            overrides = self.load()
+        key = self.get_category_key(gm_id)
+        raw = overrides.get(key)
+        if not raw:
+            return None
+        if isinstance(raw, str) and raw.strip():
+            return {"type": "sfz", "path": raw}
+        if isinstance(raw, dict) and raw.get("type") and raw.get("path"):
+            return raw
+        return None

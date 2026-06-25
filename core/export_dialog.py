@@ -24,6 +24,7 @@ from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QGroupBox,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QSpacerItem,
     QVBoxLayout,
     QWidget,
@@ -309,6 +311,56 @@ class ExportDialog(QDialog):
 
         root.addWidget(flavor_box)
 
+        # ── Tone shaping (Genre EQ + Stereo Width) ───────────────────────────
+        tone_box = QGroupBox("Tone Shaping")
+        tone_layout = QVBoxLayout(tone_box)
+        tone_layout.setSpacing(8)
+
+        tone_desc = QLabel(
+            "Genre EQ + Mid/Side stereo width — applied before the limiter."
+        )
+        tone_desc.setStyleSheet(
+            f"color:{_C['text_dim']}; font-size:10px; background:transparent;"
+        )
+        tone_layout.addWidget(tone_desc)
+
+        genre_row = QHBoxLayout()
+        genre_lbl = QLabel("Genre EQ:")
+        genre_lbl.setFixedWidth(80)
+        genre_row.addWidget(genre_lbl)
+        self._genre_combo = QComboBox()
+        self._genre_combo.addItems([
+            "other", "electronic", "hiphop", "trap", "pop", "classical", "cinematic",
+        ])
+        self._genre_combo.setToolTip(
+            "electronic / hiphop / trap: +1.5 dB low-shelf @80 Hz, +1 dB high-shelf @8 kHz\n"
+            "pop: +1 dB bell @2 kHz\n"
+            "classical / cinematic: flat\n"
+            "other: gentle +0.5 dB high-shelf @10 kHz"
+        )
+        genre_row.addWidget(self._genre_combo, 1)
+        tone_layout.addLayout(genre_row)
+
+        width_row = QHBoxLayout()
+        width_lbl = QLabel("Stereo Width:")
+        width_lbl.setFixedWidth(80)
+        width_row.addWidget(width_lbl)
+        self._width_slider = QSlider(Qt.Orientation.Horizontal)
+        self._width_slider.setRange(50, 200)
+        self._width_slider.setValue(100)
+        self._width_slider.setTickInterval(25)
+        self._width_val_lbl = QLabel("1.00×")
+        self._width_val_lbl.setFixedWidth(36)
+        self._width_val_lbl.setStyleSheet(f"color:{_C['cyan']}; font-size:10px;")
+        self._width_slider.valueChanged.connect(
+            lambda v: self._width_val_lbl.setText(f"{v / 100:.2f}×")
+        )
+        width_row.addWidget(self._width_slider, 1)
+        width_row.addWidget(self._width_val_lbl)
+        tone_layout.addLayout(width_row)
+
+        root.addWidget(tone_box)
+
         # ── Output folder ────────────────────────────────────────────────────
         folder_box = QGroupBox("Output")
         folder_layout = QVBoxLayout(folder_box)
@@ -431,6 +483,8 @@ class ExportDialog(QDialog):
             output_dir   = output_dir,
             project_name = project_name,
             flavor_id    = self._flavor_btn_group.checkedId(),
+            genre        = self._genre_combo.currentText(),
+            stereo_width = self._width_slider.value() / 100.0,
             parent       = self,
         )
         self._worker.progress_updated.connect(self._on_progress)

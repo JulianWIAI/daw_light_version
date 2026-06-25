@@ -159,6 +159,15 @@ class AudioFxChain:
             plugin = self.plugins.pop(from_index)
             self.plugins.insert(to_index, plugin)
 
+    def add_ai_plugin(self, plugin) -> None:
+        """Append a plugin tagged as AI-managed so clear_ai_slots() can remove it."""
+        plugin._ai_managed = True
+        self.plugins.append(plugin)
+
+    def clear_ai_slots(self) -> None:
+        """Remove all plugins that were added by AIMixAssistant."""
+        self.plugins = [p for p in self.plugins if not getattr(p, "_ai_managed", False)]
+
     # -------------------------------------------------------------------------
     # Automation envelope application
     # -------------------------------------------------------------------------

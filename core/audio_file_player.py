@@ -93,10 +93,21 @@ class AudioFilePlayer:
 
         with self._mix_lock:
             for tid, (audio, pos) in self._active.items():
+                chain = self._fx_chains.get(tid)
+                if chain is not None and chain.muted:
+                    finished.append(tid)
+                    continue
+
                 end   = min(pos + frames, len(audio))
-                chunk = audio[pos:end]
+                chunk = audio[pos:end].copy()
                 n     = len(chunk)
                 if n > 0:
+                    vol = float(chain.volume) if chain is not None else 1.0
+                    pan = float(chain.pan)    if chain is not None else 0.0
+                    chunk *= vol
+                    if pan != 0.0 and chunk.ndim == 2 and chunk.shape[1] == 2:
+                        chunk[:, 0] *= max(0.0, min(1.0, 1.0 - pan))
+                        chunk[:, 1] *= max(0.0, min(1.0, 1.0 + pan))
                     mixed[:n] += chunk
                 if end >= len(audio):
                     finished.append(tid)
@@ -249,10 +260,6 @@ class AudioFilePlayer:
 
             if chain is not None:
                 audio_data = chain.process(audio_data, sr)
-
-            n_ch = audio_data.shape[1] if audio_data.ndim == 2 else 1
-            if chain is not None:
-                audio_data = chain.apply_gain_pan(audio_data, n_ch)
 
             # Ensure stereo float32 C-contiguous array.
             if audio_data.ndim == 1:

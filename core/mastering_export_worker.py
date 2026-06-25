@@ -400,19 +400,23 @@ class MasteringExportWorker(QThread):
 
     def __init__(
         self,
-        render_info:  FullProjectRenderInfo,
-        configs:      List[ExportConfig],
-        output_dir:   str,
-        project_name: str,
-        flavor_id:    int  = 0,
-        parent             = None,
+        render_info:   FullProjectRenderInfo,
+        configs:       List[ExportConfig],
+        output_dir:    str,
+        project_name:  str,
+        flavor_id:     int   = 0,
+        genre:         str   = "other",
+        stereo_width:  float = 1.0,
+        parent               = None,
     ) -> None:
         super().__init__(parent)
-        self._render_info  = render_info
-        self._configs      = [c for c in configs if c.enabled]
-        self._output_dir   = output_dir
-        self._project_name = project_name or "export"
-        self._flavor_id    = max(0, min(2, int(flavor_id)))
+        self._render_info   = render_info
+        self._configs       = [c for c in configs if c.enabled]
+        self._output_dir    = output_dir
+        self._project_name  = project_name or "export"
+        self._flavor_id     = max(0, min(2, int(flavor_id)))
+        self._genre         = genre
+        self._stereo_width  = max(0.5, min(2.0, float(stereo_width)))
 
     # ── QThread entry point ───────────────────────────────────────────────────
 
@@ -462,6 +466,13 @@ class MasteringExportWorker(QThread):
                 f"Applying mastering flavor: {_FLAVOR_NAMES[self._flavor_id]}…"
             )
         flavored_mix = self._apply_flavor(raw_mix)
+
+        # Genre EQ + M/S stereo width — applied once before all targets.
+        if self._genre != "other" or self._stereo_width != 1.0:
+            self.status_changed.emit(
+                f"Tone shaping: genre={self._genre}, width={self._stereo_width:.2f}×…"
+            )
+        flavored_mix = self._apply_tone_shaping(flavored_mix)
 
         n_targets    = len(self._configs)
         ok_count     = 0
@@ -523,6 +534,32 @@ class MasteringExportWorker(QThread):
             ok = ok and self._export_stems(cfg, pipeline)
 
         return ok
+
+    # ── Genre EQ + M/S width (applied once, before all targets) ─────────────
+
+    def _apply_tone_shaping(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Apply genre-specific EQ profile and Mid/Side stereo width to the mix.
+
+        audio is (2, N) float32 (channels-first, as produced by the renderer).
+        Processing is done in (N, 2) float64 internally then converted back.
+        Falls back silently if auto_mastering cannot be imported.
+        """
+        try:
+            from .auto_mastering import AutoMasterEngine, _apply_genre_eq
+
+            # (2, N) float32 → (N, 2) float64 for the mastering functions
+            audio_ns = audio.T.astype(np.float64)
+            sr       = EXPORT_SR
+
+            engine   = AutoMasterEngine()
+            audio_ns = engine.apply_ms_width(audio_ns, sr, self._stereo_width)
+            audio_ns = _apply_genre_eq(audio_ns, sr, self._genre)
+
+            return np.ascontiguousarray(audio_ns.T, dtype=np.float32)
+        except Exception as exc:
+            logger.warning("_apply_tone_shaping skipped: %s", exc)
+            return audio
 
     # ── Mastering flavor (applied once, shared across all targets) ────────────
 

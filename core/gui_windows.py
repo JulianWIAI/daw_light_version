@@ -79,6 +79,9 @@ from .sfz_realtime_player import SfzRealTimePlayer
 from .gm_defaults_dialog import GmDefaultsDialog
 from .gm_defaults_manager import GmDefaultsManager
 from .midi_drop_importer import _parse_midi_file
+from .instrument_randomizer import InstrumentRandomizer, build_library_from_engine
+from .auto_mastering_dialog import AutoMasterDialog
+from .ai_mix_assistant import AIMixAssistant
 # Decent Sampler (.dspreset) support — parser, GUI panel, engine factory, player.
 from .dspreset_parser import parse_dspreset
 from .dspreset_panel import DsPresetPanel
@@ -5081,6 +5084,54 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self._st_scale)
         sb.addPermanentWidget(self._st_beat)
 
+        rand_btn = QPushButton("🎲 Auto-Assign Instruments")
+        rand_btn.setToolTip(
+            "Randomly assign role-appropriate Soundfonts/presets\n"
+            "to all loaded MIDI tracks for maximum variety."
+        )
+        rand_btn.setFixedHeight(22)
+        rand_btn.setStyleSheet(
+            f"QPushButton {{ background:{C['deep']}; color:#FFD700;"
+            f" border:1px solid rgba(255,215,0,0.35); border-radius:4px;"
+            f" padding:0 8px; font-size:11px; }}"
+            f"QPushButton:hover {{ border-color:#FFD700;"
+            f" background:rgba(255,215,0,0.08); }}"
+        )
+        rand_btn.clicked.connect(self._on_randomize_instruments)
+        sb.addPermanentWidget(rand_btn)
+
+        ai_btn = QPushButton("🤖 AI MIX")
+        ai_btn.setToolTip(
+            "Apply a genre-specific FX template to all tracks\n"
+            "(EQ · Compression · Reverb · Stereo · Spectral Panning)"
+        )
+        ai_btn.setFixedHeight(22)
+        ai_btn.setStyleSheet(
+            f"QPushButton {{ background:{C['deep']}; color:#9945FF;"
+            f" border:1px solid rgba(153,69,255,0.40); border-radius:4px;"
+            f" padding:0 8px; font-size:11px; }}"
+            f"QPushButton:hover {{ border-color:#9945FF;"
+            f" background:rgba(153,69,255,0.10); }}"
+        )
+        ai_btn.clicked.connect(self._on_ai_mix)
+        sb.addPermanentWidget(ai_btn)
+
+        wav_master_btn = QPushButton("✨ Master WAV")
+        wav_master_btn.setToolTip(
+            "Master an external .wav file\n"
+            "Genre EQ · M/S width · LUFS · Brickwall limiter"
+        )
+        wav_master_btn.setFixedHeight(22)
+        wav_master_btn.setStyleSheet(
+            f"QPushButton {{ background:{C['deep']}; color:#00FF88;"
+            f" border:1px solid rgba(0,255,136,0.35); border-radius:4px;"
+            f" padding:0 8px; font-size:11px; }}"
+            f"QPushButton:hover {{ border-color:#00FF88;"
+            f" background:rgba(0,255,136,0.08); }}"
+        )
+        wav_master_btn.clicked.connect(self._on_auto_master)
+        sb.addPermanentWidget(wav_master_btn)
+
         tel_btn = QPushButton("📊 TELEMETRY")
         tel_btn.setToolTip(
             "Show / hide real-time audio telemetry panels\n"
@@ -5445,19 +5496,31 @@ class MainWindow(QMainWindow):
                     track = _name_to_track.get(payload.name)
                     if track is None:
                         continue
-                    sfz = payload.sfz_path
-                    if sfz and os.path.isfile(sfz):
-                        self._start_sfz_player(track.channel, sfz)
-                        # Wire telemetry push for this SFZ player.
-                        _pl = self._sfz_engines.get(track.channel)
-                        if _pl is not None:
-                            _pl._telemetry_push = self._telemetry.push_audio
-                    else:
-                        logger.warning(
-                            "_on_files_dropped: SFZ not found for track '%s' "
-                            "(gm_id=%d, path=%s)",
-                            payload.name, payload.gm_program_id, sfz,
-                        )
+                    _entry = _gm_mgr.get_override_entry(payload.gm_program_id, _overrides)
+                    if _entry:
+                        _etype = _entry.get("type", "sfz")
+                        _epath = _entry.get("path", "")
+                        if _epath and os.path.isfile(_epath):
+                            if _etype == "sfz":
+                                self._start_sfz_player(track.channel, _epath)
+                                _pl = self._sfz_engines.get(track.channel)
+                                if _pl is not None:
+                                    _pl._telemetry_push = self._telemetry.push_audio
+                            elif _etype == "sf2":
+                                _is_drums = (payload.gm_program_id == 128) or (track.channel == 9)
+                                _ov = InstrumentPlugin(
+                                    name=payload.name, sf2_path=_epath,
+                                    bank=_entry.get("bank", 128 if _is_drums else 0),
+                                    preset=_entry.get("preset", 0),
+                                    channel=track.channel,
+                                )
+                                self._engine.register_instrument(_ov)
+                        else:
+                            logger.warning(
+                                "_on_files_dropped: override file not found for track '%s' "
+                                "(type=%s, path=%s)",
+                                payload.name, _etype, _epath,
+                            )
                     # Register a FluidSynth fallback so mastering export works.
                     if _sf2:
                         _drums  = (payload.gm_program_id == 128)
@@ -5522,13 +5585,25 @@ class MainWindow(QMainWindow):
                     track = _name_to_track.get(payload.name)
                     if track is None:
                         continue
-                    sfz = payload.sfz_path
-                    if sfz and os.path.isfile(sfz):
-                        self._start_sfz_player(track.channel, sfz)
-                        # Wire telemetry push for this SFZ player.
-                        _pl = self._sfz_engines.get(track.channel)
-                        if _pl is not None:
-                            _pl._telemetry_push = self._telemetry.push_audio
+                    _entry2 = _gm_mgr.get_override_entry(payload.gm_program_id, _overrides)
+                    if _entry2:
+                        _etype2 = _entry2.get("type", "sfz")
+                        _epath2 = _entry2.get("path", "")
+                        if _epath2 and os.path.isfile(_epath2):
+                            if _etype2 == "sfz":
+                                self._start_sfz_player(track.channel, _epath2)
+                                _pl = self._sfz_engines.get(track.channel)
+                                if _pl is not None:
+                                    _pl._telemetry_push = self._telemetry.push_audio
+                            elif _etype2 == "sf2":
+                                _is_drums2 = (payload.gm_program_id == 128) or (track.channel == 9)
+                                _ov2 = InstrumentPlugin(
+                                    name=payload.name, sf2_path=_epath2,
+                                    bank=_entry2.get("bank", 128 if _is_drums2 else 0),
+                                    preset=_entry2.get("preset", 0),
+                                    channel=track.channel,
+                                )
+                                self._engine.register_instrument(_ov2)
                     # Register a FluidSynth fallback so mastering export works
                     # even when the real-time player is SFZ / DS / VST3.
                     if _sf2:
@@ -6930,6 +7005,173 @@ class MainWindow(QMainWindow):
                 "Export failed — check the console for details.")
 
     @Slot()
+    def _on_auto_master(self) -> None:
+        """
+        Open the AutoMasterDialog.  Pre-fills the input path with the most
+        recently exported WAV, if one exists in the project export directory.
+        """
+        # Try to pre-fill with the last known export path.
+        last_wav = getattr(self, "_last_export_wav", "")
+        dlg = AutoMasterDialog(self, input_path=last_wav)
+        dlg.master_completed.connect(self._on_auto_master_done)
+        dlg.exec()
+
+    @Slot(str)
+    def _on_auto_master_done(self, output_path: str) -> None:
+        if output_path and os.path.isfile(output_path):
+            QMessageBox.information(
+                self, "Auto-Master Complete",
+                f"Mastered file saved to:\n{output_path}\n\n"
+                "You can drag it into an audio track to audition.",
+            )
+
+    @Slot()
+    def _on_ai_mix(self) -> None:
+        """
+        Show a compact genre-picker dialog then apply the AIMixAssistant
+        FX template to all loaded MIDI tracks.  Any previously AI-applied
+        plugins are cleared first so the operation is fully idempotent.
+        """
+        tracks = self._midi.get_all_tracks()
+        if not tracks:
+            QMessageBox.information(
+                self, "AI Mix",
+                "No MIDI tracks are loaded. Open a MIDI file first.",
+            )
+            return
+
+        # ── Genre picker dialog ───────────────────────────────────────────────
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox
+        _C = {"abyss": "#060A18", "deep": "#0A0E22", "cyan": "#00E5FF",
+              "purple": "#9945FF", "text": "#C8E6FF", "dim": "#3D5A80"}
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("AI Mix — Select Genre")
+        dlg.setFixedSize(300, 140)
+        dlg.setStyleSheet(
+            f"QDialog {{ background:{_C['abyss']}; color:{_C['text']}; }}"
+            f"QLabel  {{ color:{_C['text']}; font-size:10px; background:transparent; }}"
+            f"QComboBox {{ background:{_C['deep']}; color:{_C['cyan']};"
+            f" border:1px solid rgba(153,69,255,0.4); border-radius:4px;"
+            f" font-size:10px; padding:3px 8px; }}"
+            f"QComboBox QAbstractItemView {{ background:{_C['deep']};"
+            f" color:{_C['text']}; selection-background-color:{_C['purple']}; }}"
+        )
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(16, 16, 16, 12)
+        lay.setSpacing(10)
+
+        lbl = QLabel("Choose a genre to apply the AI FX template:")
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+
+        combo = QComboBox()
+        combo.addItems(["TRAP", "TECHNO", "PHONK", "POP", "HIPHOP", "EDM", "HOUSE", "CINEMATIC"])
+        # Pre-select genre matching the telemetry dashboard if one is active.
+        telem_genre = getattr(self._telemetry, "_selected_genre", "")
+        if telem_genre.upper() in [combo.itemText(i) for i in range(combo.count())]:
+            combo.setCurrentText(telem_genre.upper())
+        lay.addWidget(combo)
+
+        btn_row = QHBoxLayout()
+        btn_apply  = QPushButton("▶  Apply")
+        btn_cancel = QPushButton("Cancel")
+        for btn, color in ((btn_apply, _C["cyan"]), (btn_cancel, _C["dim"])):
+            btn.setFixedHeight(28)
+            btn.setStyleSheet(
+                f"QPushButton {{ background:{_C['deep']}; color:{color};"
+                f" border:1px solid {color}; border-radius:4px; font-size:10px; }}"
+                f"QPushButton:hover {{ background:rgba(0,0,0,0.2); }}"
+            )
+        btn_apply.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_row.addWidget(btn_apply)
+        btn_row.addWidget(btn_cancel)
+        lay.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        genre = combo.currentText()
+
+        # ── Run AIMixAssistant ────────────────────────────────────────────────
+        assistant = AIMixAssistant(
+            audio_file_player = self._audio_player,
+            tracks            = tracks,
+            master_chain      = None,   # master bus not touched via status-bar trigger
+        )
+        try:
+            assistant.apply(genre)
+            n = len(tracks)
+            self.statusBar().showMessage(
+                f"🤖 AI Mix applied — genre: {genre}, {n} track(s) processed.", 4000
+            )
+        except Exception as exc:
+            logger.warning("AIMixAssistant.apply failed: %s", exc)
+            QMessageBox.warning(
+                self, "AI Mix Error",
+                f"Failed to apply AI Mix template:\n{exc}",
+            )
+
+    @Slot()
+    def _on_randomize_instruments(self) -> None:
+        """
+        Assign a random role-appropriate SF2 instrument to every loaded MIDI track.
+
+        Uses SoundfontLibrary to scan for categorised soundfont folders first.
+        Falls back to GM preset pools within GeneralUser-GS.sf2 (or any flat
+        SF2 found in the soundfonts/ directory) when no folder structure exists.
+        """
+        tracks = self._midi.get_all_tracks()
+        if not tracks:
+            QMessageBox.information(
+                self, "Auto-Assign Instruments",
+                "No MIDI tracks are loaded. Open a MIDI file first.",
+            )
+            return
+
+        lib        = build_library_from_engine()
+        randomizer = InstrumentRandomizer(lib)
+        randomizer.reset_uniqueness()
+
+        assigned = 0
+        errors   = []
+
+        for track in tracks:
+            result = randomizer.pick(track.name)
+            if result is None:
+                errors.append(track.name)
+                continue
+
+            sf2_path, bank, preset, display_name = result
+            plugin = InstrumentPlugin(
+                name=display_name,
+                sf2_path=sf2_path,
+                bank=bank,
+                preset=preset,
+                channel=track.channel,
+            )
+
+            if self._engine.register_instrument(plugin):
+                assigned += 1
+                # Update the mixer strip label.
+                strip = self._mixer_strips.get(track.channel)
+                if strip is not None:
+                    strip.set_instrument_name(display_name)
+                self._instrument_names[track.channel] = display_name
+                logger.info(
+                    "Auto-Assign: track='%s' → '%s' (bank=%d preset=%d)",
+                    track.name, display_name, bank, preset,
+                )
+            else:
+                errors.append(track.name)
+
+        msg = f"Assigned instruments to {assigned}/{len(tracks)} track(s)."
+        if errors:
+            msg += f"\nFailed tracks: {', '.join(errors)}"
+        QMessageBox.information(self, "Auto-Assign Instruments", msg)
+
+    @Slot()
     def _on_open_midi(self) -> None:
         if self._midi.get_all_tracks():
             if QMessageBox.question(
@@ -7016,17 +7258,39 @@ class MainWindow(QMainWindow):
         for ch, chain in self._effect_chains.items():
             self._engine.apply_effect_chain(chain)
 
-        # Load GM-appropriate SFZ instruments for real-time playback.
+        # Apply per-category instrument overrides (SFZ, SF2, or VST3).
+        # Only activated when the user has explicitly set an override via GM Defaults.
+        _gm_mgr_inst  = GmDefaultsManager()
         _loaded_channels: set = set()
-        for _ch, _sfz in _ch_sfz.items():
+        for _ch, _gm_id in _ch_gm.items():
             if _ch in _loaded_channels:
                 continue
             _loaded_channels.add(_ch)
-            if _sfz and os.path.isfile(_sfz):
-                self._start_sfz_player(_ch, _sfz)
-                player = self._sfz_engines.get(_ch)
-                if player is not None:
-                    player._telemetry_push = self._telemetry.push_audio
+            _entry = _gm_mgr_inst.get_override_entry(_gm_id, _overrides)
+            if not _entry:
+                continue
+            _etype = _entry.get("type", "sfz")
+            _epath = _entry.get("path", "")
+            if not _epath or not os.path.isfile(_epath):
+                continue
+            if _etype == "sfz":
+                self._start_sfz_player(_ch, _epath)
+                _pl = self._sfz_engines.get(_ch)
+                if _pl is not None:
+                    _pl._telemetry_push = self._telemetry.push_audio
+            elif _etype == "sf2":
+                _track_name = next(
+                    (t.name for t in self._midi.get_all_tracks() if t.channel == _ch),
+                    "",
+                )
+                _is_drums = (_gm_id == 128) or (_ch == 9)
+                _ov_plugin = InstrumentPlugin(
+                    name=_track_name, sf2_path=_epath,
+                    bank=_entry.get("bank", 128 if _is_drums else 0),
+                    preset=_entry.get("preset", 0),
+                    channel=_ch,
+                )
+                self._engine.register_instrument(_ov_plugin)
 
         self._refresh_piano_roll()
         self._st_engine.setText(f"Opened: {os.path.basename(path)}")
@@ -7052,6 +7316,11 @@ class MainWindow(QMainWindow):
             Both paths    → C++ OfflineExporter mix bus → WAV on disk
             Optional      → ffmpeg                     → MP3 or AAC
         """
+        # Stop live playback before rendering — the real-time audio thread and
+        # the offline renderer both drive FluidSynth and sounddevice; running
+        # them simultaneously causes clicks, pitch drift, and repeated sections.
+        self._on_stop()
+
         midi_tracks  = self._midi.get_all_tracks()
         audio_tracks = self._midi.get_audio_tracks()
         step_rows    = self._midi.get_step_rows()
@@ -7141,6 +7410,11 @@ class MainWindow(QMainWindow):
         Nothing from the GUI is passed to the worker thread — only immutable
         Python data that was copied here on the GUI thread.
         """
+        # Stop live playback before rendering — the real-time audio thread and
+        # the offline renderer both drive FluidSynth and sounddevice; running
+        # them simultaneously causes clicks, pitch drift, and repeated sections.
+        self._on_stop()
+
         bpm = self._midi.bpm
         spb = 60.0 / max(1.0, bpm)   # seconds per beat
 
