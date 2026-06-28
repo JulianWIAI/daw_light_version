@@ -1,0 +1,112 @@
+{
+  "genre": "Pop",
+  "sample_size": 20,
+  "targets": {
+    "file_info": {
+      "duration_seconds": 194.444,
+      "sample_rate": 22050.0
+    },
+    "rhythm": {
+      "bpm": 116.456,
+      "beat_count": 350.812,
+      "groove_ms": 19.775,
+      "syncopation_percent": 34.875,
+      "onsets_detected": 587.125
+    },
+    "instruments": {
+      "activity_percentages": {
+        "kick": 24.188,
+        "snare": 31.894,
+        "hi_hat": 16.769,
+        "bass": 27.769,
+        "synth_lead": 29.331,
+        "pad_atmosphere": 31.031
+      },
+      "harmonic_vs_percussive_ratio": 0.399
+    },
+    "frequency_bands": {
+      "distribution_percentages": {
+        "sub_bass": 6.162,
+        "bass": 17.425,
+        "low_mid": 11.163,
+        "mid": 26.387,
+        "high_mid": 14.35,
+        "high": 15.769,
+        "brilliance": 7.825
+      }
+    },
+    "dynamics_and_structure": {
+      "loudness_range_db": 207.762,
+      "peak_db": 1.044,
+      "repetition_percent": 1.062,
+      "buildups_detected": 0.188,
+      "drops_detected": 1.062
+    },
+    "harmony": {
+      "key_confidence_percent": 70.312,
+      "total_chord_changes": 261.375,
+      "unique_chords": 33.562,
+      "chord_types_used": {
+        "major": 122.0,
+        "minor": 70.5,
+        "dominant": 26.0,
+        "diminished": 2.688,
+        "suspended": 37.188
+      }
+    }
+  },
+  "tolerances": {
+    "file_info": {
+      "duration_seconds": 15.361,
+      "sample_rate": 0.0
+    },
+    "rhythm": {
+      "bpm": 18.977,
+      "beat_count": 72.938,
+      "groove_ms": 7.417,
+      "syncopation_percent": 11.868,
+      "onsets_detected": 118.138
+    },
+    "instruments": {
+      "activity_percentages": {
+        "kick": 3.494,
+        "snare": 2.841,
+        "hi_hat": 2.77,
+        "bass": 3.101,
+        "synth_lead": 2.76,
+        "pad_atmosphere": 3.273
+      },
+      "harmonic_vs_percussive_ratio": 0.06
+    },
+    "frequency_bands": {
+      "distribution_percentages": {
+        "sub_bass": 1.647,
+        "bass": 2.974,
+        "low_mid": 2.595,
+        "mid": 2.77,
+        "high_mid": 1.789,
+        "high": 2.391,
+        "brilliance": 1.696
+      }
+    },
+    "dynamics_and_structure": {
+      "loudness_range_db": 58.402,
+      "peak_db": 0.029,
+      "repetition_percent": 0.099,
+      "buildups_detected": 0.39,
+      "drops_detected": 0.556
+    },
+    "harmony": {
+      "key_confidence_percent": 7.024,
+      "total_chord_changes": 34.407,
+      "unique_chords": 4.623,
+      "chord_types_used": {
+        "major": 23.956,
+        "minor": 23.019,
+        "dominant": 7.374,
+        "diminished": 1.895,
+        "suspended": 10.59
+      }
+    }
+  }
+}

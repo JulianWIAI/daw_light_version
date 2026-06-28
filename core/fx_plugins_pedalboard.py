@@ -174,6 +174,15 @@ class EQPlugin(_PedalboardPlugin):
 
     def _build_plugins(self, sample_rate: int) -> list:
         import pedalboard as pb
+        # DIAGNOSTIC ── probe 2: EQ band values at render time ────────────────
+        import logging as _log
+        _log.getLogger(__name__).info(
+            "[DIAG] EQPlugin._build_plugins() | sr=%d | "
+            "32Hz=%+.1fdB  250Hz=%+.1fdB  1kHz=%+.1fdB  4kHz=%+.1fdB  16kHz=%+.1fdB",
+            sample_rate,
+            self.eq_32, self.eq_250, self.eq_1k, self.eq_4k, self.eq_16k,
+        )
+        # ─────────────────────────────────────────────────────────────────────
         plugins = []
         if self.eq_32  != 0.0:
             plugins.append(pb.LowShelfFilter(
@@ -190,6 +199,10 @@ class EQPlugin(_PedalboardPlugin):
         if self.eq_16k != 0.0:
             plugins.append(pb.HighShelfFilter(
                 cutoff_frequency_hz=10000.0, gain_db=float(self.eq_16k), q=0.7))
+        _log.getLogger(__name__).info(  # DIAGNOSTIC
+            "[DIAG] EQPlugin: %d active filter(s) built (all-zero bands are skipped / pass-through)",
+            len(plugins),
+        )
         return plugins
 
     def create_parameter_widget(self):
@@ -327,6 +340,14 @@ class CompressorPlugin(_PedalboardPlugin):
 
     def _build_plugins(self, sample_rate: int) -> list:
         import pedalboard as pb
+        import logging as _log
+        # DIAGNOSTIC ── probe 3: Compressor params at render time ─────────────
+        _log.getLogger(__name__).info(
+            "[DIAG] CompressorPlugin._build_plugins() | "
+            "threshold=%.1fdBFS  ratio=%.1f:1  attack=%.1fms  release=%.1fms",
+            self.threshold, self.ratio, self.attack, self.release,
+        )
+        # ─────────────────────────────────────────────────────────────────────
         return [pb.Compressor(
             threshold_db=float(self.threshold),
             ratio=float(self.ratio),

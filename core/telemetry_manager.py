@@ -19,13 +19,17 @@ from typing import Optional
 import numpy as np
 
 from PySide6.QtCore import Qt, QTimer, QObject
-from PySide6.QtWidgets import QDockWidget, QMainWindow
+from PySide6.QtWidgets import (
+    QDockWidget, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QComboBox,
+)
 
 from .telemetry_waveform_widget   import TelemetryWaveformWidget
 from .telemetry_band_widget       import TelemetryBandWidget
 from .telemetry_chroma_widget     import TelemetryChromaWidget
 from .telemetry_waterfall_widget  import TelemetryWaterfallWidget
 from .telemetry_hpss_widget       import TelemetryHpssWidget
+from .benchmark_store             import scan_benchmarks, load_benchmark
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +181,15 @@ class _TelemetryAnalyzerPy:
             self._frame = frame
 
 
+# ── Limiter + gain-compensation constants ─────────────────────────────────────
+
+_LIMIT_THRESH   = 0.891   # -1 dBFS brickwall ceiling for telemetry input
+_LIMIT_REL      = 0.93    # per-push() release EMA coefficient (~1 s recovery at ~43 calls/s)
+_ENERGY_REF     = 0.60    # band mean that defines "100 % Total Energy"
+_ENERGY_LIMIT   = 1.20    # ratio above which gain compensation fires (120 %)
+_COMP_COOLDOWN  = 60      # minimum poll frames between compensations (~2 s at 30 fps)
+
+
 # ── TelemetryManager ──────────────────────────────────────────────────────────
 
 class TelemetryManager(QObject):
@@ -199,12 +212,22 @@ class TelemetryManager(QObject):
         self._window  = main_window
         self._visible = False
 
+        # Input limiter state (written from audio thread, read same thread).
+        self._limiter_gain: float = 1.0
+
+        # Gain-compensation callback and cooldown counter.
+        self._overload_cb   = None
+        self._comp_cooldown = 0
+
         # Panel widgets (created once, reused across show/hide cycles).
         self._waveform  = TelemetryWaveformWidget()
         self._bands     = TelemetryBandWidget()
         self._chroma    = TelemetryChromaWidget()
         self._waterfall = TelemetryWaterfallWidget()
         self._hpss      = TelemetryHpssWidget()
+
+        # Benchmark index: display name → pathlib.Path
+        self._bench_path_map = {name: path for name, path in scan_benchmarks()}
 
         self._docks: list = []
 
@@ -230,14 +253,73 @@ class TelemetryManager(QObject):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    def _build_bands_container(self) -> QWidget:
+        """
+        Wrap the Freq Bands widget in a container that adds a "Target Profile"
+        combo box above it.  The combo lists all discovered benchmark JSON files;
+        selecting one pushes targets+tolerances to both _bands and _hpss.
+        """
+        _BG  = "#0a0a14"
+        _DIM = "#3d5a80"
+        _GRN = "#44ffaa"
+
+        container = QWidget()
+        container.setStyleSheet(f"background:{_BG};")
+        vlay = QVBoxLayout(container)
+        vlay.setContentsMargins(4, 4, 4, 2)
+        vlay.setSpacing(3)
+
+        # ── Profile selector row ──────────────────────────────────────────────
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(4)
+
+        lbl = QLabel("Target profile:")
+        lbl.setStyleSheet(f"color:{_DIM}; font-size:9px; background:transparent;")
+        ctrl_row.addWidget(lbl)
+
+        self._profile_combo = QComboBox()
+        self._profile_combo.setStyleSheet(
+            f"QComboBox {{ background:{_BG}; color:{_GRN}; border:1px solid {_DIM};"
+            f" border-radius:3px; font-size:9px; padding:1px 4px; }}"
+            f"QComboBox QAbstractItemView {{ background:{_BG}; color:{_GRN};"
+            f" selection-background-color:#1a1a40; }}"
+        )
+        self._profile_combo.addItem("— None —")
+        for name in sorted(self._bench_path_map.keys()):
+            self._profile_combo.addItem(name)
+        self._profile_combo.currentTextChanged.connect(self._on_profile_changed)
+        ctrl_row.addWidget(self._profile_combo, stretch=1)
+
+        vlay.addLayout(ctrl_row)
+        vlay.addWidget(self._bands)
+
+        return container
+
+    def _on_profile_changed(self, name: str) -> None:
+        """Load the selected benchmark and push targets to both telemetry panels."""
+        if name == "— None —" or name not in self._bench_path_map:
+            self._bands.clear_benchmark()
+            self._hpss.clear_benchmark()
+            return
+        try:
+            profile = load_benchmark(self._bench_path_map[name])
+            self._bands.set_benchmark(profile.freq_targets, profile.freq_tolerances)
+            self._hpss.set_benchmark(profile.hp_ratio_target, profile.hp_ratio_tolerance)
+        except Exception as exc:
+            logger.warning("benchmark load failed: %s", exc)
+            self._bands.clear_benchmark()
+            self._hpss.clear_benchmark()
+
     def setup_docks(self) -> None:
         """Add all five telemetry QDockWidgets to the main window."""
+        bands_container = self._build_bands_container()
+
         specs = [
-            ("📈 Waveform",   self._waveform,  Qt.BottomDockWidgetArea),
-            ("🎚 Freq Bands", self._bands,      Qt.BottomDockWidgetArea),
-            ("🎵 Chroma",     self._chroma,     Qt.BottomDockWidgetArea),
-            ("🌊 Waterfall",  self._waterfall,  Qt.RightDockWidgetArea),
-            ("⚡ H/P Split",  self._hpss,       Qt.RightDockWidgetArea),
+            ("📈 Waveform",   self._waveform,    Qt.BottomDockWidgetArea),
+            ("🎚 Freq Bands", bands_container,   Qt.BottomDockWidgetArea),
+            ("🎵 Chroma",     self._chroma,       Qt.BottomDockWidgetArea),
+            ("🌊 Waterfall",  self._waterfall,    Qt.RightDockWidgetArea),
+            ("⚡ H/P Split",  self._hpss,         Qt.RightDockWidgetArea),
         ]
         prev_bottom_dock = None
         for title, widget, area in specs:
@@ -273,8 +355,26 @@ class TelemetryManager(QObject):
             self._timer.start()   # always runs — analyzer is never None
             self._visible = True
 
+    def set_gain_compensation_callback(self, cb) -> None:
+        """Register cb(gain_mult: float) — called on the Qt main thread when
+        Total Energy exceeds 120 % of the nominal reference level."""
+        self._overload_cb = cb
+
     def push_audio(self, mono: np.ndarray) -> None:
-        """Push a mono float32 chunk to the analyzer (audio-thread safe)."""
+        """Apply input limiter then push a mono float32 chunk to the analyzer.
+
+        The limiter uses instant attack / ~1 s release so the HUD reflects
+        perceived energy rather than raw clip peaks.  Audio-thread safe.
+        """
+        mono = np.asarray(mono, dtype=np.float32)
+        if mono.size:
+            peak = float(np.max(np.abs(mono)))
+            if peak > _LIMIT_THRESH:
+                # Instant attack: snap gain down to prevent any clipping.
+                self._limiter_gain = min(self._limiter_gain, _LIMIT_THRESH / peak)
+            # Exponential release toward unity (runs every push, not just on peaks).
+            self._limiter_gain = _LIMIT_REL * self._limiter_gain + (1.0 - _LIMIT_REL)
+            mono = mono * self._limiter_gain
         try:
             self._analyzer.push(mono)
         except Exception:
@@ -291,7 +391,8 @@ class TelemetryManager(QObject):
     # ── Internal 30-FPS polling loop ──────────────────────────────────────────
 
     def _poll(self) -> None:
-        """Query the analyzer once and push the frame to every panel."""
+        """Query the analyzer once, push the frame to every panel, and run
+        the gain-compensation check."""
         try:
             frame = self._analyzer.get_frame()
         except Exception as exc:
@@ -303,3 +404,22 @@ class TelemetryManager(QObject):
         self._chroma   .update_frame(frame)
         self._waterfall.update_frame(frame)
         self._hpss     .update_frame(frame)
+
+        # ── Total Energy readout + gain compensation ──────────────────────────
+        bands = frame.bands
+        total_energy = float(np.mean(bands)) if len(bands) else 0.0
+        self._bands.set_total_energy(total_energy)
+
+        if self._comp_cooldown > 0:
+            self._comp_cooldown -= 1
+        elif self._overload_cb is not None:
+            energy_ratio = total_energy / _ENERGY_REF
+            if energy_ratio > _ENERGY_LIMIT:
+                gain_mult = _ENERGY_LIMIT / energy_ratio   # proportional pull-back
+                self._overload_cb(gain_mult)
+                self._comp_cooldown = _COMP_COOLDOWN
+                logger.info(
+                    "TelemetryManager: gain compensation %.0f%% applied "
+                    "(energy %.0f%% > %.0f%% limit)",
+                    gain_mult * 100, energy_ratio * 100, _ENERGY_LIMIT * 100,
+                )

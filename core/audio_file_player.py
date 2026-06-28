@@ -64,6 +64,10 @@ class AudioFilePlayer:
         self._stream_ok  = False
         self._next_ch    = 4   # legacy compat
 
+        # Optional telemetry sink — identical pattern to AudioEngine / SfzRealTimePlayer.
+        # Set externally after construction; called from _sd_callback with a mono float32 array.
+        self._telemetry_push = None
+
         self._start_stream()
 
     # -------------------------------------------------------------------------
@@ -119,6 +123,14 @@ class AudioFilePlayer:
         np.clip(mixed, -1.0, 1.0, out=mixed)
         outdata[:] = mixed
 
+        # Push the mono mix to the telemetry analyzer so the freq-band and H/P
+        # panels reflect the post-EQ audio from audio-file tracks in real time.
+        if self._telemetry_push is not None:
+            try:
+                self._telemetry_push((mixed[:, 0] + mixed[:, 1]) * 0.5)
+            except Exception:
+                pass
+
     # -------------------------------------------------------------------------
     # Track registration (kept for API compatibility with gui_windows)
     # -------------------------------------------------------------------------
@@ -147,6 +159,20 @@ class AudioFilePlayer:
             self._fx_chains[track_id] = chain
             last = self._last_played.get(track_id)
             active = self._active.get(track_id)
+
+        # DIAGNOSTIC ── probe 4: chain update gate ────────────────────────────
+        plugin_names = [
+            f"{getattr(p, 'DISPLAY_NAME', '?')}(enabled={getattr(p, 'enabled', '?')})"
+            for p in (chain.plugins if chain else []) if p is not None
+        ]
+        logger.info(
+            "[DIAG] update_fx_chain() track=%d | chain_plugins=%s | "
+            "is_playing=%s | will_rerender=%s",
+            track_id, plugin_names,
+            active is not None,
+            last is not None and active is not None,
+        )
+        # ─────────────────────────────────────────────────────────────────────
 
         if last is not None and active is not None:
             audio, pos = active
@@ -257,6 +283,19 @@ class AudioFilePlayer:
 
             if audio_data.shape[0] == 0:
                 return
+
+            # DIAGNOSTIC ── probe 5: offline render entry ─────────────────────
+            logger.info(
+                "[DIAG] _load_and_play() track=%d | path=%s | "
+                "samples=%d sr=%d | chain=%s plugins=%s",
+                track_id, path, audio_data.shape[0], sr,
+                "present" if chain is not None else "NONE (pass-through)",
+                [
+                    f"{getattr(p, 'DISPLAY_NAME', '?')}(enabled={getattr(p, 'enabled', '?')})"
+                    for p in (chain.plugins if chain else []) if p is not None
+                ],
+            )
+            # ─────────────────────────────────────────────────────────────────
 
             if chain is not None:
                 audio_data = chain.process(audio_data, sr)

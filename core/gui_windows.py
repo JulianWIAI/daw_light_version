@@ -4601,6 +4601,20 @@ class MainWindow(QMainWindow):
         """
         self._midi.set_audio_callback(self._play_audio_file)
         self._midi.set_stop_audio_callback(self._audio_player.stop_all)
+        # Tap the audio-file mixing output into the telemetry analyzer so that
+        # post-EQ audio from WAV tracks is reflected in the freq-band display.
+        self._audio_player._telemetry_push = self._telemetry.push_audio
+
+        def _on_energy_overload(gain_mult: float) -> None:
+            """Reduce all track faders proportionally when Total Energy > 120%."""
+            for strip in self._audio_mixer_strips.values():
+                new_val = max(0, min(200, int(strip.vol.value() * gain_mult)))
+                strip.vol.setValue(new_val)
+            for strip in self._mixer_strips.values():
+                new_val = max(0, min(100, int(strip.vol.value() * gain_mult)))
+                strip.vol.setValue(new_val)
+
+        self._telemetry.set_gain_compensation_callback(_on_energy_overload)
         logger.info("Audio clip playback wired (sounddevice backend).")
 
     def _init_timeline_bridge(self) -> None:

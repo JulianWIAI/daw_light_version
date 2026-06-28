@@ -57,6 +57,7 @@ from core.telemetry_band_panel      import TelemetryBandPanel
 from core.telemetry_chroma_panel    import TelemetryChromaPanel
 from core.telemetry_waterfall_panel import TelemetryWaterfallPanel
 from core.telemetry_hpss_panel      import TelemetryHpssPanel
+from core.benchmark_store           import scan_benchmarks, load_benchmark
 
 _BG        = '#0a0a14'
 _TITLE_BG  = '#111126'
@@ -274,6 +275,11 @@ class TelemetryDashboard(tk.Toplevel):
         self._band_history: deque = deque(maxlen=_HISTORY_FRAMES)
         self._prev_bands: List[float] = []
 
+        # Benchmark index: name → pathlib.Path
+        self._bench_path_map: Dict[str, Any] = {
+            name: path for name, path in scan_benchmarks()
+        }
+
         self._build_ui()
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -324,7 +330,7 @@ class TelemetryDashboard(tk.Toplevel):
         self._waterfall_panel = TelemetryWaterfallPanel(bottom_frame)
         self._waterfall_panel.pack(side=tk.LEFT)
 
-        # Row 3: Genre selector + match indicator.
+        # Row 3: Genre selector + benchmark profile selector + match indicator.
         genre_frame = tk.Frame(self, bg=_TITLE_BG)
         genre_frame.grid(row=3, column=0, columnspan=2, sticky='ew',
                          padx=0, pady=0)
@@ -344,7 +350,29 @@ class TelemetryDashboard(tk.Toplevel):
             bg=_BG, fg=_TEXT_COL, activebackground='#1a1a40',
             activeforeground=_ALERT_COL, font=('Consolas', 8),
         )
-        genre_menu.pack(side=tk.LEFT, padx=(0, 10))
+        genre_menu.pack(side=tk.LEFT, padx=(0, 6))
+
+        # Separator
+        tk.Label(genre_frame, text='|', bg=_TITLE_BG, fg=_DIM_COL,
+                 font=('Consolas', 8)).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Label(genre_frame, text='Target profile:', bg=_TITLE_BG,
+                 fg=_TEXT_COL, font=('Consolas', 8)).pack(side=tk.LEFT, padx=(0, 4))
+
+        _bench_names = ['— None —'] + sorted(self._bench_path_map.keys())
+        self._bench_var = tk.StringVar(value='— None —')
+        bench_menu = tk.OptionMenu(genre_frame, self._bench_var, *_bench_names,
+                                   command=self._on_benchmark_changed)
+        bench_menu.config(
+            bg=_BG, fg='#44ffaa', activebackground='#1a1a40',
+            activeforeground='#44ffaa', highlightthickness=0,
+            font=('Consolas', 8), relief='flat', bd=0,
+        )
+        bench_menu['menu'].config(
+            bg=_BG, fg='#44ffaa', activebackground='#1a1a40',
+            activeforeground='#44ffaa', font=('Consolas', 8),
+        )
+        bench_menu.pack(side=tk.LEFT, padx=(0, 10))
 
         self._match_var   = tk.StringVar(value='')
         self._match_label = tk.Label(genre_frame, textvariable=self._match_var,
@@ -373,6 +401,23 @@ class TelemetryDashboard(tk.Toplevel):
         else:
             self._match_var.set(f'[ {genre} ]  listening…')
             self._match_label.config(fg=_DIM_COL)
+
+    def _on_benchmark_changed(self, _value: str = '') -> None:
+        """Load and apply the selected acoustic benchmark profile."""
+        name = self._bench_var.get()
+        if name == '— None —' or name not in self._bench_path_map:
+            self._band_panel.clear_benchmark()
+            self._hpss_panel.clear_benchmark()
+            return
+        try:
+            profile = load_benchmark(self._bench_path_map[name])
+            self._band_panel.set_benchmark(profile.freq_targets, profile.freq_tolerances)
+            self._hpss_panel.set_benchmark(profile.hp_ratio_target, profile.hp_ratio_tolerance)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("benchmark load failed: %s", exc)
+            self._band_panel.clear_benchmark()
+            self._hpss_panel.clear_benchmark()
 
     def _compute_extra(self, bands: List[float]) -> Dict[str, float]:
         """

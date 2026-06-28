@@ -89,10 +89,27 @@ class AudioFxChain:
         """
         # Snapshot prevents IndexError if the GUI thread modifies the list
         # concurrently (the GIL makes list() atomic enough for this use case).
+        # DIAGNOSTIC ── probe 1: chain entry snapshot ─────────────────────────
+        logger.info(
+            "[DIAG] AudioFxChain.process() track=%d | %d plugin(s) in chain | "
+            "muted=%s | plugins=%s",
+            self.track_id,
+            len(self.plugins),
+            self.muted,
+            [
+                f"{getattr(p, 'DISPLAY_NAME', type(p).__name__)}(enabled={getattr(p, 'enabled', '?')})"
+                for p in self.plugins if p is not None
+            ],
+        )
+        # ─────────────────────────────────────────────────────────────────────
         for plugin in list(self.plugins):
             if plugin is None:
                 continue
             if not plugin.enabled:
+                logger.info(  # DIAGNOSTIC ── probe 1b: bypass gate
+                    "[DIAG]   BYPASSED plugin '%s' on track %d",
+                    getattr(plugin, "DISPLAY_NAME", "?"), self.track_id,
+                )
                 continue  # plugin is bypassed -- skip without touching audio
             try:
                 audio = plugin.process(audio, sample_rate)
