@@ -23,6 +23,8 @@
 #include <thread>
 #include <vector>
 
+#include "TelemetryNoiseFloor.h"
+
 // Number of waveform sample points stored in each telemetry frame
 // (matches the typical canvas pixel width of the waveform panel).
 static constexpr int TELEMETRY_WAVE_POINTS = 480;
@@ -165,4 +167,19 @@ private:
     // Background thread lifecycle.
     std::thread       _thread;
     std::atomic<bool> _running{false};
+
+    // ── Noise-floor calibrator ─────────────────────────────────────────────────
+    // Self-calibrates during silence frames; subtracts the floor from active
+    // spectra before band/chroma computation so only DAW content is analysed.
+    // Not guarded by a mutex — used exclusively on the background worker thread.
+    TelemetryNoiseFloor _noise_floor{FFT_SIZE / 2 + 1};
+
+    // RMS thresholds for silence detection (background thread only).
+    // EPSILON_RMS : input is effectively all-zeros (Python gate closed) —
+    //               publish a zero frame; do NOT feed zeros into calibration.
+    // SILENCE_RMS : genuine ambient noise (-60 dBFS) — calibrate floor, zero frame.
+    // SIGNAL_RMS  : active DAW signal (-50 dBFS) — subtract floor, full analysis.
+    static constexpr float EPSILON_RMS = 1e-8f;   // practically zero
+    static constexpr float SILENCE_RMS = 1e-3f;   // -60 dBFS
+    static constexpr float SIGNAL_RMS  = 3.16e-3f; // -50 dBFS  (6 dB above SILENCE)
 };

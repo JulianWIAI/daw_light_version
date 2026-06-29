@@ -30,6 +30,8 @@ from .telemetry_chroma_widget     import TelemetryChromaWidget
 from .telemetry_waterfall_widget  import TelemetryWaterfallWidget
 from .telemetry_hpss_widget       import TelemetryHpssWidget
 from .benchmark_store             import scan_benchmarks, load_benchmark
+from .telemetry_noise_gate        import TelemetryNoiseGate
+from .telemetry_noise_floor       import TelemetryNoiseFloorCalibrator
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,14 @@ class _TelemetryAnalyzerPy:
         (8000, 20000),# air
     ]
 
+    # ── Silence-detection RMS thresholds (mirror C++ TelemetryAnalyzer constants) ──
+    # EPSILON_RMS : below this the buffer is all-zeros (Python gate closed) — zero frame
+    # SILENCE_RMS : genuine ambient noise (-60 dBFS)  — calibrate floor, zero frame
+    # SIGNAL_RMS  : active DAW signal    (-50 dBFS)   — subtract floor, full analysis
+    _EPSILON_RMS: float = 1e-8
+    _SILENCE_RMS: float = 1e-3   # -60 dBFS
+    _SIGNAL_RMS:  float = 3.16e-3  # -50 dBFS
+
     def __init__(self, sample_rate: int = 44100) -> None:
         self._sr     = sample_rate
         self._accum  = np.zeros(self._FFT_SIZE, dtype=np.float32)
@@ -97,6 +107,13 @@ class _TelemetryAnalyzerPy:
         f_valid = self._freqs[self._chroma_idx]
         self._chroma_pc  = (np.round(12.0 * np.log2(f_valid / 440.0) + 57.0)
                             .astype(int) % 12)
+
+        # Noise-floor calibrator: accumulates silence-period spectra and
+        # subtracts the per-bin floor from active-signal spectra before
+        # band/chroma analysis.  n_bins = FFT_SIZE // 2 + 1.
+        self._noise_floor = TelemetryNoiseFloorCalibrator(
+            n_bins = self._FFT_SIZE // 2 + 1,
+        )
 
     # ── Public interface ───────────────────────────────────────────────────────
 
@@ -134,12 +151,52 @@ class _TelemetryAnalyzerPy:
     # ── Internal DSP ──────────────────────────────────────────────────────────
 
     def _process(self) -> None:
-        # RMS
+        # ── RMS for this accumulation window ────────────────────────────────────
         rms = float(np.sqrt(np.mean(self._accum ** 2)))
 
-        # FFT magnitude²
+        # ── FFT magnitude spectrum (raw, before any noise subtraction) ───────────
         spectrum = np.abs(np.fft.rfft(self._accum * self._window)).astype(np.float32)
-        mag2     = spectrum ** 2
+
+        # ── Silence detection (mirrors the C++ TelemetryAnalyzer logic) ─────────
+        #
+        #   rms < EPSILON_RMS  →  all-zeros from Python gate (gate closed)
+        #       Publish a zeroed frame; skip noise-floor calibration.
+        #
+        #   EPSILON_RMS ≤ rms < SILENCE_RMS  →  genuine ambient system noise
+        #       Calibrate the noise floor from this spectrum; publish zero frame.
+        #
+        #   rms ≥ SIGNAL_RMS  →  active DAW signal
+        #       Subtract the calibrated floor before band/chroma analysis.
+        #
+        # The 10 dB gap (SILENCE_RMS → SIGNAL_RMS) provides hysteresis so the
+        # display does not flicker on signals near the gate threshold.
+        # ─────────────────────────────────────────────────────────────────────────
+
+        is_zeros  = rms < self._EPSILON_RMS
+        is_noise  = (not is_zeros) and (rms < self._SILENCE_RMS)
+        is_signal = rms >= self._SIGNAL_RMS
+
+        if is_noise:
+            # Genuine silence: calibrate per-bin noise floor from this spectrum.
+            # Deliberately skipped when is_zeros=True (gate-pushed zeros would
+            # corrupt the calibration by driving the floor toward zero).
+            self._noise_floor.add_silence_frame(spectrum)
+
+        if is_zeros or is_noise:
+            # Publish a zeroed frame — all display panels decay to clean baseline.
+            with self._lock:
+                self._frame = _PyFrame()
+            return
+
+        if not is_signal:
+            # Transition band (SILENCE_RMS ≤ rms < SIGNAL_RMS): keep the
+            # previous frame visible to avoid flicker; do not recalculate.
+            return
+
+        # ── Active signal: subtract noise floor before analysis ──────────────────
+        # subtract() is a no-op (returns unchanged copy) until calibration is done.
+        clean_spectrum = self._noise_floor.subtract(spectrum)
+        mag2 = clean_spectrum ** 2
 
         # 7 frequency bands (replicates the C++ band_mean / global_mean formula)
         global_mean = float(mag2.mean()) or 1.0
@@ -149,12 +206,12 @@ class _TelemetryAnalyzerPy:
             bm   = float(mag2[mask].mean()) if mask.any() else 0.0
             bands.append(min(bm / global_mean, 3.0) / 3.0)
 
-        # 12-bin chroma (vectorised)
+        # 12-bin chroma (vectorised, on denoised spectrum)
         chroma = np.zeros(12, dtype=np.float32)
         np.add.at(chroma, self._chroma_pc, mag2[self._chroma_idx])
 
-        # HPSS scalar indicators
-        self._hpss_q.append(spectrum)
+        # HPSS scalar indicators (on denoised spectrum)
+        self._hpss_q.append(clean_spectrum)
         if len(self._hpss_q) >= 2:
             stacked = np.array(list(self._hpss_q))   # shape: (frames, bins)
             s_max   = stacked.max() or 1.0
@@ -218,6 +275,13 @@ class TelemetryManager(QObject):
         # Gain-compensation callback and cooldown counter.
         self._overload_cb   = None
         self._comp_cooldown = 0
+
+        # Noise gate: chunk-level gate applied in push_audio() before the
+        # audio reaches the analyzer.  During its CALIBRATING phase all audio
+        # passes through unchanged so the downstream analyzer can measure the
+        # ambient noise floor.  After calibration, silent chunks become
+        # all-zeros so the telemetry display decays to a clean baseline.
+        self._noise_gate = TelemetryNoiseGate(sample_rate=self._SAMPLE_RATE)
 
         # Panel widgets (created once, reused across show/hide cycles).
         self._waveform  = TelemetryWaveformWidget()
@@ -361,24 +425,65 @@ class TelemetryManager(QObject):
         self._overload_cb = cb
 
     def push_audio(self, mono: np.ndarray) -> None:
-        """Apply input limiter then push a mono float32 chunk to the analyzer.
+        """Apply input limiter + noise gate, then push a mono float32 chunk to
+        the analyzer.
 
-        The limiter uses instant attack / ~1 s release so the HUD reflects
-        perceived energy rather than raw clip peaks.  Audio-thread safe.
+        Signal chain
+        ------------
+        1. Input limiter (instant attack, ~1 s release, −1 dBFS ceiling).
+        2. TelemetryNoiseGate:
+               CALIBRATING  → audio passes through so the analyzer builds its
+                              spectral noise-floor baseline.
+               CLOSED/CLOSING → all-zeros forwarded; the analyzer publishes
+                              zeroed frames and all display panels decay to
+                              a clean baseline.
+               OPEN/OPENING → audio passes through (possibly gain-ramped);
+                              the analyzer subtracts the calibrated noise
+                              floor before computing bands and chroma.
+        3. Push the gated chunk to the analyzer (C++ or Python fallback).
+
+        Audio-thread safe; no heap allocation on the hot path.
         """
         mono = np.asarray(mono, dtype=np.float32)
-        if mono.size:
-            peak = float(np.max(np.abs(mono)))
-            if peak > _LIMIT_THRESH:
-                # Instant attack: snap gain down to prevent any clipping.
-                self._limiter_gain = min(self._limiter_gain, _LIMIT_THRESH / peak)
-            # Exponential release toward unity (runs every push, not just on peaks).
-            self._limiter_gain = _LIMIT_REL * self._limiter_gain + (1.0 - _LIMIT_REL)
-            mono = mono * self._limiter_gain
+        if not mono.size:
+            return
+
+        # ── 1. Input limiter ───────────────────────────────────────────────────
+        peak = float(np.max(np.abs(mono)))
+        if peak > _LIMIT_THRESH:
+            # Instant attack: snap gain down so no sample exceeds the ceiling.
+            self._limiter_gain = min(self._limiter_gain, _LIMIT_THRESH / peak)
+        # Exponential release toward unity (every push, not only on peaks).
+        self._limiter_gain = _LIMIT_REL * self._limiter_gain + (1.0 - _LIMIT_REL)
+        mono = mono * self._limiter_gain
+
+        # ── 2. Noise gate ──────────────────────────────────────────────────────
+        # During the CALIBRATING phase the gate returns mono unchanged so the
+        # downstream analyzer sees the real ambient noise and can self-calibrate.
+        # After calibration, silent chunks are replaced with zeros.
+        gated = self._noise_gate.process(mono)
+
+        # ── 3. Push to analyzer ────────────────────────────────────────────────
         try:
-            self._analyzer.push(mono)
+            self._analyzer.push(gated)
         except Exception:
             pass
+
+    def reset_noise_gate(self) -> None:
+        """Reset the noise gate and noise-floor calibration.
+
+        Call this when the audio device changes, a new project is loaded, or
+        the acoustic environment changes significantly (e.g. moving from a
+        quiet room to a noisy one) so the gate re-calibrates from scratch.
+        """
+        self._noise_gate.reset()
+        # Reset the Python-fallback noise floor calibrator if active.
+        if isinstance(self._analyzer, _TelemetryAnalyzerPy):
+            self._analyzer._noise_floor.reset()
+        logger.info(
+            "TelemetryManager: noise gate and noise-floor calibration reset "
+            "(state: %s).", self._noise_gate.state_name
+        )
 
     def shutdown(self) -> None:
         """Stop the polling timer and DSP thread. Call from closeEvent."""

@@ -168,11 +168,11 @@ void TelemetryAnalyzer::_process(const float* samples, int n) {
         std::memcpy(windowed, _accum.data(), FFT_SIZE * sizeof(float));
         _apply_hanning(windowed);
 
-        // 3b. Run FFT → magnitude spectrum.
+        // 3b. Run FFT → raw magnitude spectrum.
         float mags[N_BINS];
         _run_fft(windowed, mags);
 
-        // 3c-e. Compute all telemetry fields locally (no lock held yet).
+        // 3c. RMS for this accumulation window.
         float rms_val = 0.f;
         if (_rms_count > 0) {
             rms_val     = static_cast<float>(std::sqrt(_rms_sq_sum / _rms_count));
@@ -180,20 +180,71 @@ void TelemetryAnalyzer::_process(const float* samples, int n) {
             _rms_count  = 0;
         }
 
-        float bands[7]   = {};
-        float chroma[12] = {};
-        _compute_bands (mags, N_BINS, bands);
-        _compute_chroma(mags, N_BINS, chroma);
-        _update_hpss   (mags, N_BINS);
+        // ── Silence detection & noise-floor handling ─────────────────────────
+        //
+        // Three operating regimes based on the RMS of the accumulation window:
+        //
+        //   rms_val < EPSILON_RMS  →  input was all-zeros pushed by the Python
+        //       TelemetryNoiseGate (DAW silent, gate calibrated and closed).
+        //       Publish a zeroed frame; do NOT feed these zeros to the noise
+        //       floor calibrator — they would drive the floor toward zero.
+        //
+        //   EPSILON_RMS ≤ rms_val < SILENCE_RMS  →  genuine ambient system
+        //       noise (ADC noise, fan interference, -70 to -60 dBFS).
+        //       Feed the raw spectrum into the noise-floor calibrator, then
+        //       publish a zeroed frame so the display stays at baseline.
+        //
+        //   rms_val ≥ SIGNAL_RMS  →  active DAW signal (≥ -50 dBFS).
+        //       Subtract the calibrated noise floor from the raw spectrum
+        //       before all further analysis so only the DAW content is shown.
+        //
+        // The 10 dB gap between SILENCE_RMS and SIGNAL_RMS acts as hysteresis
+        // to prevent rapid state chatter near the threshold.
+        // ─────────────────────────────────────────────────────────────────────
 
-        float harm = 0.f, perc = 0.f;
-        _read_hpss(harm, perc);
+        const bool is_zeros  = (rms_val < EPSILON_RMS);
+        const bool is_noise  = (!is_zeros && rms_val < SILENCE_RMS);
+        const bool is_signal = (rms_val >= SIGNAL_RMS);
 
-        float waveform[TELEMETRY_WAVE_POINTS];
-        _snapshot_waveform(waveform);
+        if (is_noise) {
+            // Genuine silence/noise: calibrate the per-bin noise floor.
+            // Never called when is_zeros is true to protect calibration data.
+            _noise_floor.add_frame(mags);
+        }
 
-        // 3f. Publish under mutex.
-        {
+        if (is_zeros || is_noise) {
+            // No meaningful signal: publish a zeroed telemetry frame so all
+            // display panels decay to a clean baseline.
+            std::lock_guard<std::mutex> lk(_frame_mutex);
+            _frame.rms        = 0.f;
+            _frame.harmonic   = 0.f;
+            _frame.percussive = 0.f;
+            std::fill(_frame.bands,    _frame.bands    + 7,                    0.f);
+            std::fill(_frame.chroma,   _frame.chroma   + 12,                   0.f);
+            std::fill(_frame.waveform, _frame.waveform + TELEMETRY_WAVE_POINTS, 0.f);
+            ++_frame.tick;
+
+        } else if (is_signal) {
+            // Active signal: subtract calibrated noise floor from the raw
+            // spectrum before band/chroma/HPSS computation so that system
+            // noise does not contaminate the displayed pattern.
+            float clean_mags[N_BINS];
+            _noise_floor.subtract(mags, clean_mags);
+
+            // 3d-e. Compute all telemetry fields from the denoised spectrum.
+            float bands[7]   = {};
+            float chroma[12] = {};
+            _compute_bands (clean_mags, N_BINS, bands);
+            _compute_chroma(clean_mags, N_BINS, chroma);
+            _update_hpss   (clean_mags, N_BINS);
+
+            float harm = 0.f, perc = 0.f;
+            _read_hpss(harm, perc);
+
+            float waveform[TELEMETRY_WAVE_POINTS];
+            _snapshot_waveform(waveform);
+
+            // 3f. Publish under mutex.
             std::lock_guard<std::mutex> lk(_frame_mutex);
             _frame.rms        = rms_val;
             _frame.harmonic   = harm;
@@ -203,6 +254,9 @@ void TelemetryAnalyzer::_process(const float* samples, int n) {
             std::memcpy(_frame.waveform, waveform, sizeof(waveform));
             ++_frame.tick;
         }
+        // Note: the narrow transition band SILENCE_RMS ≤ rms_val < SIGNAL_RMS
+        // produces neither calibration nor a new published frame — the previous
+        // frame remains visible, providing hysteresis against display flicker.
 
         _accum_pos = 0;
     }
